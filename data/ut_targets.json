@@ -1,0 +1,316 @@
+{
+  "drivers/leds/leds-lp3944.c": [
+    "lp3944_dim_set_period",
+    "lp3944_dim_set_dutycycle",
+    "lp3944_led_set",
+    "lp3944_led_set_blink",
+    "lp3944_reg_read"
+  ],
+  "drivers/leds/leds-lm3532.c": [
+    "lm3532_get_als_imp_index",
+    "lm3532_get_index",
+    "lm3532_get_als_avg_index",
+    "lm3532_get_ramp_index"
+  ],
+  "drivers/leds/leds-lm3533.c": [
+    "time_to_val",
+    "lm3533_led_get_hw_delay"
+  ],
+  "drivers/leds/leds-tca6507.c": [
+    "TO_BRIGHT",
+    "choose_times",
+    "set_select",
+    "set_code"
+  ],
+  "drivers/hwmon/ds1621.c": [
+    "DS1621_TEMP_TO_REG",
+    "ds1621_init_client",
+    "ds1621_update_client"
+  ],
+  "drivers/hwmon/emc2103.c": [
+    "read_u8_from_i2c",
+    "read_temp_from_i2c",
+    "read_fan_from_i2c",
+    "write_fan_target_to_i2c"
+  ],
+  "drivers/hwmon/emc2305.c": [
+    "emc2305_get_cdev_idx",
+    "emc2305_is_visible",
+    "emc2305_write",
+    "emc2305_identify"
+  ],
+  "drivers/hwmon/emc6w201.c": [
+    "emc6w201_read16",
+    "emc6w201_write16",
+    "emc6w201_read8",
+    "emc6w201_write8"
+  ],
+  "drivers/hwmon/hih6130.c": [
+    "hih6130_temp_ticks_to_millicelsius",
+    "hih6130_rh_ticks_to_per_cent_mille",
+    "hih6130_update_measurements"
+  ],
+  "drivers/hwmon/hs3001.c": [
+    "hs3001_extract_temperature",
+    "hs3001_data_fetch_command",
+    "hs3001_is_visible"
+  ],
+  "drivers/hwmon/htu31.c": [
+    "htu31_data_fetch_command",
+    "htu31_read_serial_number"
+  ],
+  "drivers/hwmon/ina209.c": [
+    "ina209_from_reg",
+    "ina209_to_reg",
+    "ina209_reg_from_interval"
+  ],
+  "drivers/hwmon/isl28022.c": [
+    "isl28022_read_in",
+    "isl28022_is_visible",
+    "isl28022_is_writeable_reg",
+    "isl28022_is_volatile_reg"
+  ],
+  "drivers/hwmon/lm80.c": [
+    "FAN_TO_REG",
+    "lm80_read_value",
+    "lm80_write_value",
+    "lm80_init_client"
+  ],
+  "drivers/hwmon/lm83.c": [
+    "lm83_regmap_is_volatile",
+    "lm83_temp_read",
+    "lm83_temp_write",
+    "lm83_is_visible"
+  ],
+  "drivers/hwmon/lm92.c": [
+    "lm92_temp_read",
+    "lm92_is_visible"
+  ],
+  "drivers/hwmon/lm95234.c": [
+    "lm95234_is_visible"
+  ],
+  "drivers/hwmon/lm95245.c": [
+    "temp_from_reg_signed"
+  ],
+  "drivers/hwmon/ltc4151.c": [
+    "ltc4151_get_value"
+  ],
+  "drivers/hwmon/ltc4245.c": [
+    "ltc4245_is_visible"
+  ],
+  "drivers/hwmon/ltc4261.c": [
+    "ltc4261_get_value"
+  ],
+  "drivers/hwmon/adt7310.c": [
+    "adt7310_spi_write_byte",
+    "adt7310_spi_write_word"
+  ],
+  "drivers/hwmon/max31730.c": [
+    "max31730_check_reg_temp"
+  ],
+  "drivers/hwmon/max16065.c": [
+    "max16065_read_adc"
+  ],
+  "drivers/hwmon/stts751.c": [
+    "stts751_read_reg8"
+  ],
+  "drivers/iio/temperature/mcp9600.c": [
+    "mcp9600_get_alert_index"
+  ],
+  "drivers/iio/temperature/tsys01.c": [
+    "tsys01_crc_valid"
+  ],
+  "drivers/iio/light/cm32181.c": [
+    "cm32181_read_als_it"
+  ],
+  "drivers/iio/light/isl29028.c": [
+    "isl29028_find_prox_sleep_index"
+  ],
+  "drivers/iio/light/isl76682.c": [
+    "isl76682_is_volatile_reg"
+  ],
+  "drivers/iio/light/max44000.c": [
+    "max44000_readable_reg"
+  ],
+  "drivers/iio/light/noa1305.c": [
+    "noa1305_writable_reg"
+  ],
+  "drivers/iio/light/opt4001.c": [
+    "opt4001_als_time_to_index",
+    "opt4001_calculate_crc",
+    "opt4001_readable_reg"
+  ],
+  "drivers/iio/light/opt4060.c": [
+    "opt4060_als_time_to_index",
+    "opt4060_calculate_crc",
+    "opt4060_calc_th_reg",
+    "opt4060_calc_val_from_th_reg"
+  ],
+  "drivers/iio/light/tsl2563.c": [
+    "tsl2563_adc_shiftbits",
+    "tsl2563_calib_adc"
+  ],
+  "drivers/power/supply/acer_a500_battery.c": [
+    "a500_battery_unit_adjustment",
+    "a500_battery_get_ec_data_index"
+  ],
+  "drivers/power/supply/ds2781_battery.c": [
+    "ds2781_get_voltage",
+    "ds2781_get_temperature",
+    "ds2781_get_current"
+  ],
+  "drivers/power/supply/ds2780_battery.c": [
+    "ds2780_get_voltage",
+    "ds2780_get_temperature",
+    "ds2780_get_current"
+  ],
+  "drivers/power/supply/ug3105_battery.c": [
+    "ug3105_get_status",
+    "ug3105_get_capacity",
+    "ug3105_read_word"
+  ],
+  "drivers/power/supply/surface_battery.c": [
+    "spwr_battery_is_full",
+    "spwr_battery_prop_status",
+    "spwr_battery_prop_technology"
+  ],
+  "drivers/iio/gyro/adis16136.c": [
+    "adis16136_set_freq",
+    "__adis16136_get_freq"
+  ],
+  "drivers/iio/gyro/adxrs290.c": [
+    "adxrs290_find_match",
+    "adxrs290_spi_write_reg"
+  ],
+  "drivers/iio/gyro/bmg160_core.c": [
+    "bmg160_convert_freq_to_bit",
+    "bmg160_set_mode"
+  ],
+  "drivers/iio/humidity/am2315.c": [
+    "am2315_crc"
+  ],
+  "drivers/iio/humidity/dht11.c": [
+    "dht11_decode_byte",
+    "dht11_decode"
+  ],
+  "drivers/iio/humidity/ens210.c": [
+    "ens210_crc7"
+  ],
+  "drivers/leds/leds-lp8788.c": [
+    "lp8788_led_init_device",
+    "lp8788_led_enable"
+  ],
+  "drivers/leds/leds-bd2802.c": [
+    "bd2802_write_byte"
+  ],
+  "drivers/iio/light/stk3310.c": [
+    "stk3310_check_chip_id",
+    "stk3310_get_index"
+  ],
+  "drivers/iio/light/tsl2591.c": [
+    "tsl2591_als_time_to_fval",
+    "tsl2591_compatible_gain",
+    "tsl2591_multiplier_to_gain",
+    "tsl2591_gain_to_multiplier"
+  ],
+  "drivers/iio/light/ltr501.c": [
+    "ltr501_get_gain_index",
+    "ltr501_match_samp_freq",
+    "ltr501_calculate_lux"
+  ],
+  "drivers/iio/light/adux1020.c": [
+    "adux1020_find_index"
+  ],
+  "drivers/iio/light/si1133.c": [
+    "si1133_get_int_time_index",
+    "si1133_scale_to_swgain",
+    "si1133_param_query",
+    "si1133_param_set"
+  ],
+  "drivers/iio/light/max44009.c": [
+    "max44009_threshold_byte_from_fraction",
+    "max44009_get_thr_reg",
+    "max44009_lux_raw",
+    "max44009_read_int_time"
+  ],
+  "drivers/iio/light/apds9300.c": [
+    "apds9300_calculate_lux"
+  ],
+  "drivers/iio/light/si1145.c": [
+    "si1145_compress",
+    "si1145_uncompress",
+    "si1145_proximity_adcgain_from_scale",
+    "si1145_intensity_adcgain_from_scale",
+    "si1145_param_query"
+  ],
+  "drivers/iio/light/vl6180.c": [
+    "vl6180_meas_reg_val_from_mhz"
+  ],
+  "drivers/iio/temperature/mlx90632.c": [
+    "mlx90632_channel_new_select",
+    "mlx90632_calc_ta4"
+  ],
+  "drivers/iio/light/veml6075.c": [
+    "veml6075_read_responsivity",
+    "veml6075_uvb_comp",
+    "veml6075_uva_comp"
+  ],
+  "drivers/iio/light/tsl2772.c": [
+    "tsl2772_device_id_verif"
+  ],
+  "drivers/iio/light/rohm-bu27034.c": [
+    "bu27034_fixp_calc_t23",
+    "gain_mul_div_helper",
+    "bu27034_fixp_calc_t1_64bit",
+    "bu27034_fixp_calc_t1"
+  ],
+  "drivers/iio/humidity/hdc3020.c": [
+    "hdc3020_thresh_clr",
+    "hdc3020_thresh_get_temp",
+    "hdc3020_thresh_get_hum",
+    "hdc3020_thresh_set_hum",
+    "hdc3020_thresh_set_temp"
+  ],
+  "drivers/iio/light/lm3533-als.c": [
+    "lm3533_als_get_threshold_reg"
+  ],
+  "drivers/iio/light/zopt2201.c": [
+    "zopt2201_enable_mode"
+  ],
+  "drivers/iio/temperature/ltc2983.c": [
+    "__convert_to_raw_sign",
+    "__convert_to_raw"
+  ],
+  "drivers/iio/temperature/mlx90635.c": [
+    "mlx90635_calc_ta4"
+  ],
+  "drivers/iio/temperature/max31856.c": [
+    "max31856_write"
+  ],
+  "drivers/iio/temperature/tmp007.c": [
+    "tmp007_identify"
+  ],
+  "drivers/iio/gyro/fxas21002c_core.c": [
+    "fxas21002c_odr_value_from_hz",
+    "fxas21002c_lpf_value_from_bw",
+    "fxas21002c_hpf_value_from_sel",
+    "fxas21002c_odr_hz_from_value",
+    "fxas21002c_lpf_bw_from_value",
+    "fxas21002c_hpf_sel_from_value"
+  ],
+  "drivers/power/supply/smb347-charger.c": [
+    "current_to_hw"
+  ],
+  "drivers/power/supply/bq24257_charger.c": [
+    "bq24257_find_idx"
+  ],
+  "drivers/power/supply/bq24190_charger.c": [
+    "bq24190_find_idx"
+  ],
+  "drivers/iio/humidity/hdc100x.c": [
+    "hdc100x_update_config"
+  ],
+  "drivers/iio/humidity/si7020.c": [
+    "si7020_update_reg"
+  ]
+}

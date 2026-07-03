@@ -1,0 +1,2 @@
+"""Scenario-contract verification helpers."""
+

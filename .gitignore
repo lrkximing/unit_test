@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+output*/
+mutation_eval*/
+final_results/
+
+mutant_catalog.json
+mutant_catalog.csv
+mutation_summary.json
+mutation_scores*
+
+*.log
+*.tmp
