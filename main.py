@@ -579,9 +579,20 @@ def _fake_name_for_boundary_expression(expression: str) -> str:
     safe = re.sub('[^A-Za-z0-9_]', '_', expression or 'boundary')
     return f'fake_{safe}'
 
+def _ambiguous_boundary_expressions(controls: List[Dict]) -> Set[str]:
+    """A callee name cannot identify one hook when several call sites use it."""
+    call_sites: Dict[str, Set[str]] = {}
+    for control in controls:
+        expression = str(control.get('boundary_expression', '') or '').strip()
+        boundary_id = str(control.get('boundary_id', '') or '').strip()
+        if expression and boundary_id:
+            call_sites.setdefault(expression, set()).add(boundary_id)
+    return {expression for expression, ids in call_sites.items() if len(ids) > 1}
+
 def _boundary_hook_fake_specs(scenario_context: Dict, linux_kernel_path: str, missing_symbols: Set[str], test_code: str) -> List[Dict[str, object]]:
     target = (scenario_context or {}).get('target', {}) or {}
     controls = [item for item in target.get('export_interface_details', []) or [] if isinstance(item, dict) and item.get('source_kind') == 'boundary_hook' and (item.get('boundary_control_role') == 'set_hook')]
+    ambiguous_expressions = _ambiguous_boundary_expressions(controls)
     specs: List[Dict[str, object]] = []
     code_without_auto_blocks = _remove_auto_boundary_fake_blocks(test_code or '')
 
@@ -607,6 +618,8 @@ def _boundary_hook_fake_specs(scenario_context: Dict, linux_kernel_path: str, mi
         return candidates[0] if candidates else None
     for control in controls:
         original = str(control.get('boundary_expression', '') or '').strip()
+        if original in ambiguous_expressions:
+            continue
         boundary_id = str(control.get('boundary_id', '') or '').strip()
         canonical_fake_name = _fake_name_for_boundary_expression(original)
         hook_targets = _hook_targets_for_boundary(boundary_id)
@@ -639,22 +652,26 @@ def _default_boundary_fake_return(alias_name: str) -> Optional[str]:
     return None
 
 def _normalize_boundary_hook_fake_contract(test_code: str, scenario_context: Dict, linux_kernel_path: str, missing_symbols: Optional[Set[str]]=None) -> Tuple[str, List[Dict[str, object]], List[Dict[str, object]]]:
-    """Force direct-boundary hooks to use framework-owned canonical fake names.
+    """Normalize fakes only when a direct boundary callee identifies one hook.
 
     The LLM may edit the canonical fake implementation, but it must not invent
     independent hook fake declarations such as fake_foo_success or
     fake_foo_negative. Those aliases are normalized to fake_foo plus the
-    generated fake_foo_return state.
+    generated fake_foo_return state. Repeated calls to the same callee need
+    call-site-specific behavior, so they are left for ordinary build repair.
     """
     original_code = test_code or ''
     target = (scenario_context or {}).get('target', {}) or {}
     controls = [item for item in target.get('export_interface_details', []) or [] if isinstance(item, dict) and item.get('source_kind') == 'boundary_hook' and (item.get('boundary_control_role') == 'set_hook')]
+    ambiguous_expressions = _ambiguous_boundary_expressions(controls)
     specs = _boundary_hook_fake_specs(scenario_context, linux_kernel_path, missing_symbols or set(), original_code)
     updated = original_code
     actions: List[Dict[str, object]] = []
     marker_updates: List[Tuple[str, str, str]] = []
     for control in controls:
         original = str(control.get('boundary_expression', '') or '').strip()
+        if original in ambiguous_expressions:
+            continue
         boundary_id = str(control.get('boundary_id', '') or '').strip()
         if not original or not boundary_id:
             continue
@@ -1299,7 +1316,8 @@ def main():
                             _write_text(summary_path, summary_text)
                             record_history_event('build', iteration_count, 'failed', log_file=log_file, summary_log=summary_path)
                             snapshot_test_case(iteration_count)
-                            if iteration_count < MAX_FIX_ATTEMPTS and True:
+                            auto_build_passed = False
+                            if iteration_count < MAX_FIX_ATTEMPTS:
                                 current_source_for_auto_repair = _read_text(test_case_save_path)
                                 auto_repaired_source, inserted_fake_specs = _auto_insert_missing_boundary_fakes(current_source_for_auto_repair, summary_text, scenario_context, linux_kernel_path)
                                 auto_repaired_source, auto_repairs = _auto_repair_hook_fake_signatures(auto_repaired_source, summary_text)
@@ -1314,17 +1332,28 @@ def main():
                                     _write_json(auto_repair_path, {'stage': 'build', 'iteration': iteration_count, 'actions': auto_actions, 'diff': auto_diff, 'reason': 'compiler-reported missing boundary fake symbols or hook setter function pointer type'})
                                     _write_text(test_case_save_path, auto_repaired_source)
                                     record_history_event('build', iteration_count, 'auto_repaired_boundary_fakes', actions=auto_actions, repair_log=auto_repair_path)
+                                    try:
+                                        run_build_step()
+                                    except subprocess.CalledProcessError as auto_exc:
+                                        auto_error_log = _collect_process_error(auto_exc)
+                                        auto_log_file = _save_error_log(function_output_dir, function.name, 'build_after_auto_repair', iteration_count, auto_error_log)
+                                        summary_text = _extract_error_summary(auto_error_log)
+                                        auto_summary_path = os.path.join(function_output_dir, f'{function.name}_build_after_auto_repair_iteration{iteration_count}_summary.log')
+                                        _write_text(auto_summary_path, summary_text)
+                                        record_history_event('build', iteration_count, 'auto_repair_failed', log_file=auto_log_file, summary_log=auto_summary_path)
+                                    else:
+                                        record_history_event('build', iteration_count, 'passed_after_auto_repair')
+                                        auto_build_passed = True
+                            if not auto_build_passed:
+                                if iteration_count >= MAX_FIX_ATTEMPTS:
+                                    build_failed_summary(iteration_count, summary_text)
+                                    break
+                                if not apply_llm_fix('build', summary_text):
+                                    record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='build', rejection=last_patch_rejection)
                                     iteration_count += 1
                                     continue
-                            if iteration_count >= MAX_FIX_ATTEMPTS:
-                                build_failed_summary(iteration_count, summary_text)
-                                break
-                            if not apply_llm_fix('build', summary_text):
-                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='build', rejection=last_patch_rejection)
                                 iteration_count += 1
                                 continue
-                            iteration_count += 1
-                            continue
                         print('Qemu 配置完毕')
                         coverage_summary = empty_coverage_summary()
                         kunit_summary = empty_kunit_summary()
