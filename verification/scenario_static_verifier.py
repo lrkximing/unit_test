@@ -8,6 +8,7 @@ from verification.assertion_quality import (
     binding_is_nontrivial_assertion,
     effective_check_ids,
 )
+from verification.oracle_contract_verifier import assess_oracle_binding, direct_check_ids
 from scenario.harness_feasibility import (
     active_contracts,
     active_scenario_ids,
@@ -46,16 +47,16 @@ class ScenarioStaticResult:
 def is_blocking_scenario_static_error(error: str) -> bool:
     """Return True for static findings that should stop a candidate before build.
 
-    Keep this set deliberately small.  Static scenario validation is an audit
-    and repair signal; it should not prevent build/KUnit from running unless the
-    candidate damages the harness contract or tries to replace production code.
-    Otherwise we lose the normal iteration path where build/runtime failures are
-    fed back to the LLM for repair.
+    Definite assertion/contract mismatches must not become passing KUnit results.
+    Unresolved semantic relations remain warnings so the regular build/runtime
+    feedback path can continue.
     """
     message = error or ""
     blocking_prefixes = (
         "Generated test code redefines original driver function",
         "Scenario contract without scenario_id.",
+        "Oracle mismatch:",
+        "Oracle weakened:",
     )
     if message.startswith(blocking_prefixes):
         return True
@@ -606,6 +607,36 @@ def verify_scenario_contracts(test_code: str, plan_or_registry: Dict) -> Scenari
             if not check_id:
                 errors.append(f"Scenario {scenario_id} has a scenario check without check_id.")
                 continue
+            direct_bindings = [
+                (test_function, binding)
+                for test_function in tests
+                for binding in collect_kunit_bindings(test_function.full_text)
+                if check_id in direct_check_ids(binding, test_function.full_text)
+            ]
+            if not direct_bindings and not (
+                _check_satisfied_by_guard_return(check, contract, local_check_ids)
+                or _check_satisfied_by_runtime_witness(check, contract, local_witness_ids)
+            ):
+                errors.append(
+                    f"Oracle mismatch: Scenario {scenario_id} check {check_id} has no assertion "
+                    "immediately bound to its RACA_CHECK marker."
+                )
+            for test_function, binding in direct_bindings:
+                assessment = assess_oracle_binding(
+                    binding, check, test_function.full_text,
+                    str(contract.get("export_function", "") or ""),
+                    test_code or "",
+                )
+                if assessment.status == "mismatch":
+                    errors.append(
+                        f"Oracle mismatch: Scenario {scenario_id} check {check_id} "
+                        f"in test {test_function.name}: {assessment.reason}."
+                    )
+                elif assessment.status == "unresolved":
+                    warnings.append(
+                        f"Scenario {scenario_id} check {check_id} in test {test_function.name} "
+                        f"cannot be fully validated statically: {assessment.reason}."
+                    )
             if check_id not in local_check_ids and _check_satisfied_by_guard_return(check, contract, local_check_ids):
                 local_check_ids.add(check_id)
                 covered_checks.add(check_id)

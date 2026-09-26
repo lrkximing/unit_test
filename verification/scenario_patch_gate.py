@@ -3,6 +3,7 @@ from typing import Dict, List
 
 from validation.region_check import validate_protected_regions
 from validation.repair_audit import build_repair_audit
+from verification.oracle_contract_verifier import oracle_repair_errors
 from verification.scenario_static_verifier import (
     blocking_scenario_static_errors,
     nonblocking_scenario_static_findings,
@@ -45,6 +46,8 @@ def evaluate_scenario_patch(
         audit_warnings.extend(nonblocking_scenario_static_findings(scenario_result.errors))
     if audit.target_wrapper_missing:
         hard_errors.append("Patch removed or bypassed the target test_export wrapper call.")
+    registry = scenario_context.get("scenario_registry") or scenario_context
+    hard_errors.extend(oracle_repair_errors(before_code, after_code, registry))
 
     if audit.removed_tests:
         audit_warnings.append(f"Patch removed tests: {audit.removed_tests}")

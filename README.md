@@ -33,6 +33,23 @@ List the selected targets without modifying the kernel tree.
 python main.py --dry-run-targets
 ```
 
+## Scenario oracle validation
+
+Before compilation, the checker parses KUnit assertions next to `RACA_CHECK`
+markers and compares supported return, field, and boundary-result relations
+with their scenario contracts. It follows simple local assignments in source
+order and can compare an assertion with a configured return from an explicitly
+bound mock. Definite mismatches block the candidate and enter the repair loop;
+relations that cannot be established statically are reported as warnings, not
+as proof of correctness. During repair, removed checks, changed scenario
+bindings, and broadening of an existing equality check are rejected.
+
+Run the focused regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 Run RACA on one target function. This is useful for checking whether the
 environment is configured correctly.
 
