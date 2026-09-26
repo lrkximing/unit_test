@@ -209,21 +209,36 @@ def _expected_from_contract(check: Dict) -> Optional[str]:
 
 def _configured_mock_return(
     check: Dict, full_code: str, assignments: List[Tuple[int, str, str]],
-    before_line: int, wrapper: str,
+    before_line: int, wrapper: str, test_body: str,
 ) -> Optional[str]:
-    """Follow an explicit RACA_MOCK binding to a simple configured fake return."""
+    """Follow the fake actually installed by this test, not a global marker alone."""
     relation = str(check.get("expected_relation", "") or "")
     boundary = re.search(r"\bproduced by\s+([A-Za-z0-9_]+)", relation)
     if boundary is None or not full_code:
         return None
-    marker = re.search(
-        r"RACA_MOCK\s*:\s*boundary=" + re.escape(boundary.group(1))
-        + r"\s*;\s*original=[^;]+\s*;\s*replacement=([A-Za-z_][A-Za-z0-9_]*)",
-        full_code,
+    setup = "\n".join(_without_comments(test_body).splitlines()[:before_line])
+    target_call = re.search(r"\b" + re.escape(wrapper) + r"\s*\(", setup) if wrapper else None
+    if target_call:
+        setup = setup[:target_call.start()]
+    hooks = re.findall(
+        r"\braca_boundary_" + re.escape(boundary.group(1))
+        + r"_set_hook\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        setup,
     )
-    if marker is None:
-        return None
-    fake = marker.group(1)
+    fake = hooks[-1] if hooks else ""
+    if not fake:
+        markers = re.findall(
+            r"RACA_MOCK\s*:\s*boundary=" + re.escape(boundary.group(1))
+            + r"\s*;\s*original=[^;]+\s*;\s*replacement=([A-Za-z_][A-Za-z0-9_]*)",
+            full_code,
+        )
+        installed = [
+            candidate for candidate in set(markers)
+            if re.search(r"\b" + re.escape(candidate) + r"\b", setup)
+        ]
+        if len(installed) != 1:
+            return None
+        fake = installed[0]
     definition = re.search(
         r"\b" + re.escape(fake) + r"\s*\([^;{}]*\)\s*\{", _without_comments(full_code)
     )
@@ -335,12 +350,17 @@ def assess_oracle_binding(
             if negative is False:
                 return OracleAssessment("mismatch", "expected value is not a negative boundary errno")
             configured = _configured_mock_return(
-                check, full_code, assignments, binding.start_line, wrapper
+                check, full_code, assignments, binding.start_line, wrapper, test_body
             )
             configured_value = _known_value(configured or "")
             asserted_value = _known_value(resolved_expected)
             if configured_value is not None and asserted_value is not None:
                 if configured_value != asserted_value:
+                    if _is_negative(configured or "") is not True:
+                        return OracleAssessment(
+                            "unresolved",
+                            "boundary value differs from the asserted errno; the driver may map it through a guard",
+                        )
                     return OracleAssessment(
                         "mismatch", "expected value differs from the configured boundary return"
                     )

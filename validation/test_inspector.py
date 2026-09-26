@@ -258,13 +258,16 @@ def _inspect_with_tree_sitter(code_text: str) -> TestSourceInfo:
         if not _is_kunit_test_definition(node, code, name):
             continue
         body = _node_text(code, body_node) if body_node is not None else full_text
+        # Tree-sitter positions are byte offsets, while annotation lookup
+        # slices the decoded string. Earlier non-ASCII comments shift them.
+        function_char_start = len(code[:node.start_byte].decode("utf-8", errors="ignore"))
         info.test_functions.append(
             TestFunctionInfo(
                 name=name,
                 body=body,
                 full_text=full_text,
-                scenario_ids=_scenario_ids_for_function(code_text, full_text, node.start_byte),
-                variant_id=_variant_id_for_function(code_text, full_text, node.start_byte),
+                scenario_ids=_scenario_ids_for_function(code_text, full_text, function_char_start),
+                variant_id=_variant_id_for_function(code_text, full_text, function_char_start),
                 call_names=function_call_names,
             )
         )
