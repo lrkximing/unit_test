@@ -1,7 +1,7 @@
 from analysis.driver_parser import *
 from generation.generate_stub import *
 from generation.generate_test import *
-from generation.scenario_context import generate_scenario_context, save_scenario_context
+from generation.scenario_context import generate_scenario_context, prepare_scenario_registry, save_scenario_context
 from run.config_change import *
 from run.build import *
 from run.gcov import ensure_gcov_profile, collect_gcov_results, summarize_function_coverage
@@ -17,6 +17,10 @@ from verification.scenario_progress import scenario_status_complete, scenario_st
 from verification.scenario_static_verifier import blocking_scenario_static_errors, mock_bindings_from_test, nonblocking_scenario_static_findings
 from verification.assertion_quality import nontrivial_assertion_tests
 from validation.test_inspector import inspect_test_source
+from validation.repair_audit import source_tokens, test_set_errors
+from verification.coverage_feedback import coverage_target_met, evaluation_action, missed_branch_feedback
+from run.repair_state import RepairState, input_identity, source_build_failure
+from verification.coverage_source_mapping import CoverageFeedbackMappingError, map_feedback
 import argparse
 import difflib
 import os
@@ -74,7 +78,7 @@ def _collect_process_error(exc: subprocess.CalledProcessError) -> str:
     parts = []
     for attr in ('stdout', 'stderr', 'output'):
         value = getattr(exc, attr, None)
-        if value:
+        if value and value not in parts:
             parts.append(value)
     text = '\n'.join(parts).strip()
     return text or str(exc)
@@ -404,7 +408,7 @@ def _extract_error_summary(log_text: str) -> str:
             i += 1
     if snippets:
         return '\n'.join(snippets)
-    return _condense_log(log_text)
+    return log_text
 
 def _format_line_snippets(file_path: Optional[str], lines: List[int]) -> List[str]:
     if not file_path or not os.path.exists(file_path) or (not lines):
@@ -507,7 +511,10 @@ def _rewrite_function_signature(test_code: str, function_name: str, return_type:
         names.extend((f'arg{idx}' for idx in range(len(names), len(param_types))))
     new_params = ', '.join((_format_c_param(param_type, names[idx]) for idx, param_type in enumerate(param_types))) or 'void'
     new_signature = f"{match.group('prefix')}{return_type} {function_name}({new_params})"
-    return (test_code[:match.start()] + new_signature + test_code[match.end():], True)
+    updated = test_code[:match.start()] + new_signature + test_code[match.end():]
+    if source_tokens(updated) == source_tokens(test_code):
+        return (test_code, False)
+    return (updated, True)
 
 def _auto_repair_hook_fake_signatures(test_code: str, build_log: str) -> Tuple[str, List[Dict[str, object]]]:
     repairs: List[Dict[str, object]] = []
@@ -579,28 +586,39 @@ def _fake_name_for_boundary_expression(expression: str) -> str:
     safe = re.sub('[^A-Za-z0-9_]', '_', expression or 'boundary')
     return f'fake_{safe}'
 
-def _ambiguous_boundary_expressions(controls: List[Dict]) -> Set[str]:
-    """A callee name cannot identify one hook when several call sites use it."""
-    call_sites: Dict[str, Set[str]] = {}
-    for control in controls:
-        expression = str(control.get('boundary_expression', '') or '').strip()
-        boundary_id = str(control.get('boundary_id', '') or '').strip()
-        if expression and boundary_id:
-            call_sites.setdefault(expression, set()).add(boundary_id)
-    return {expression for expression, ids in call_sites.items() if len(ids) > 1}
+
+def _boundary_hook_arguments(test_code):
+    raw = (test_code or '').encode()
+    result, pending = {}, [C_PARSER.parse(raw).root_node]
+    while pending:
+        node = pending.pop()
+        pending.extend(node.named_children)
+        if node.type != 'call_expression':
+            continue
+        callee = node.child_by_field_name('function')
+        arguments = node.child_by_field_name('arguments')
+        if callee is None or arguments is None:
+            continue
+        name = raw[callee.start_byte:callee.end_byte].decode()
+        if name.startswith('raca_boundary_') and name.endswith('_set_hook'):
+            args = [child for child in arguments.named_children if child.type != 'comment']
+            if len(args) == 1:
+                argument = raw[args[0].start_byte:args[0].end_byte].decode()
+                result.setdefault(name, set()).add(argument)
+    return result
 
 def _boundary_hook_fake_specs(scenario_context: Dict, linux_kernel_path: str, missing_symbols: Set[str], test_code: str) -> List[Dict[str, object]]:
     target = (scenario_context or {}).get('target', {}) or {}
     controls = [item for item in target.get('export_interface_details', []) or [] if isinstance(item, dict) and item.get('source_kind') == 'boundary_hook' and (item.get('boundary_control_role') == 'set_hook')]
-    ambiguous_expressions = _ambiguous_boundary_expressions(controls)
     specs: List[Dict[str, object]] = []
-    code_without_auto_blocks = _remove_auto_boundary_fake_blocks(test_code or '')
+    hook_arguments = _boundary_hook_arguments(test_code)
+    definitions = set(inspect_test_source(test_code or '').function_definitions)
 
     def _hook_targets_for_boundary(boundary_id: str) -> Set[str]:
-        return {match.group(1) for match in re.finditer(f'\\braca_boundary_{re.escape(boundary_id)}_set_hook\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)', test_code or '') if match.group(1) not in {'NULL', 'null'}}
+        return hook_arguments.get(f'raca_boundary_{boundary_id}_set_hook', set()) - {'NULL', '0'}
 
     def _has_static_function_definition(function_name: str) -> bool:
-        return bool(re.search(f'^\\s*static\\s+[\\w\\s\\*]+\\b{re.escape(function_name)}\\s*\\(', code_without_auto_blocks, re.MULTILINE))
+        return function_name in definitions
 
     def _state_symbol_pool(canonical_fake_name: str, hook_fake_name: str, related: Set[str]) -> Set[str]:
         prefixes = {canonical_fake_name, hook_fake_name}
@@ -618,8 +636,6 @@ def _boundary_hook_fake_specs(scenario_context: Dict, linux_kernel_path: str, mi
         return candidates[0] if candidates else None
     for control in controls:
         original = str(control.get('boundary_expression', '') or '').strip()
-        if original in ambiguous_expressions:
-            continue
         boundary_id = str(control.get('boundary_id', '') or '').strip()
         canonical_fake_name = _fake_name_for_boundary_expression(original)
         hook_targets = _hook_targets_for_boundary(boundary_id)
@@ -640,110 +656,67 @@ def _boundary_hook_fake_specs(scenario_context: Dict, linux_kernel_path: str, mi
             return_state_name = _preferred_state_name(state_pool, canonical_fake_name, fake_name, '_return') or f'{canonical_fake_name}_return'
         call_count_name = _preferred_state_name(state_pool, canonical_fake_name, fake_name, '_call_count')
         specs.append({'boundary_id': boundary_id, 'original': original, 'canonical_fake_name': canonical_fake_name, 'fake_name': fake_name, 'return_type': return_type, 'params': params, 'return_state_name': return_state_name, 'call_count_name': call_count_name, 'related_missing': sorted(related_missing), 'hook_targets': sorted(hook_targets)})
-    return specs
+    unique_specs = {}
+    for spec in specs:
+        name = str(spec['canonical_fake_name'])
+        previous = unique_specs.get(name)
+        if previous is None:
+            spec['boundary_ids'] = [spec['boundary_id']]
+            unique_specs[name] = spec
+            continue
+        if source_tokens(f"{previous['return_type']} f({previous['params']});") != source_tokens(f"{spec['return_type']} f({spec['params']});"):
+            raise ValueError(f'Conflicting boundary fake signatures for {name}')
+        previous['boundary_ids'].append(spec['boundary_id'])
+        for field in ('related_missing', 'hook_targets'):
+            previous[field] = sorted(set(previous.get(field, [])) | set(spec.get(field, [])))
+    return list(unique_specs.values())
 
-def _default_boundary_fake_return(alias_name: str) -> Optional[str]:
-    if re.search('(?:^|_)(?:success|ok)(?:_|$)', alias_name):
-        return '0'
-    if re.search('(?:^|_)(?:positive|valid)(?:_|$)', alias_name):
-        return '1'
-    if re.search('(?:^|_)(?:negative|error|err|fail|failure|errval)(?:_|$)', alias_name):
-        return '-EIO'
-    return None
+def _boundary_fake_contract_diagnostics(test_code, scenario_context):
+    if 'mock_interfaces' in (scenario_context or {}):
+        from generation.mock_interfaces import mock_interface_errors
+        return mock_interface_errors(test_code, scenario_context)
+    errors = []
+    controls = ((scenario_context or {}).get('target') or {}).get('export_interface_details', [])
+    arguments = _boundary_hook_arguments(test_code)
+    for control in controls:
+        if control.get('source_kind') != 'boundary_hook' or control.get('boundary_control_role') != 'set_hook':
+            continue
+        canonical = _fake_name_for_boundary_expression(control.get('boundary_expression', ''))
+        setter = f"raca_boundary_{control.get('boundary_id')}_set_hook"
+        for fake in sorted(arguments.get(setter, [])):
+            if fake not in {canonical, 'NULL', '0'}:
+                errors.append(f'{setter} must install {canonical}, not {fake}. Preserve the required behavior in the canonical fake body and state; do not infer it from a helper name.')
+    return errors
 
 def _normalize_boundary_hook_fake_contract(test_code: str, scenario_context: Dict, linux_kernel_path: str, missing_symbols: Optional[Set[str]]=None) -> Tuple[str, List[Dict[str, object]], List[Dict[str, object]]]:
-    """Normalize fakes only when a direct boundary callee identifies one hook.
-
-    The LLM may edit the canonical fake implementation, but it must not invent
-    independent hook fake declarations such as fake_foo_success or
-    fake_foo_negative. Those aliases are normalized to fake_foo plus the
-    generated fake_foo_return state. Repeated calls to the same callee need
-    call-site-specific behavior, so they are left for ordinary build repair.
-    """
+    """Supply missing canonical skeletons without rewriting model-authored behavior."""
     original_code = test_code or ''
-    target = (scenario_context or {}).get('target', {}) or {}
-    controls = [item for item in target.get('export_interface_details', []) or [] if isinstance(item, dict) and item.get('source_kind') == 'boundary_hook' and (item.get('boundary_control_role') == 'set_hook')]
-    ambiguous_expressions = _ambiguous_boundary_expressions(controls)
-    specs = _boundary_hook_fake_specs(scenario_context, linux_kernel_path, missing_symbols or set(), original_code)
-    updated = original_code
-    actions: List[Dict[str, object]] = []
-    marker_updates: List[Tuple[str, str, str]] = []
-    for control in controls:
-        original = str(control.get('boundary_expression', '') or '').strip()
-        if original in ambiguous_expressions:
-            continue
-        boundary_id = str(control.get('boundary_id', '') or '').strip()
-        if not original or not boundary_id:
-            continue
-        canonical = _fake_name_for_boundary_expression(original)
-        return_state = f'{canonical}_return'
-        state_aliases: List[str] = []
-        for suffix in ('_errval', '_retval', '_ret', '_result', '_value'):
-            state_alias = f'{canonical}{suffix}'
-            updated_next = re.sub(f'\\b{re.escape(state_alias)}\\b', return_state, updated)
-            if updated_next != updated:
-                state_aliases.append(state_alias)
-                updated = updated_next
-        if state_aliases:
-            actions.append({'boundary_id': boundary_id, 'original': original, 'canonical_fake_name': canonical, 'return_state_name': return_state, 'normalized_state_aliases': state_aliases})
-    if not specs:
-        if updated == original_code:
-            return (original_code, [], [])
-        return (updated, [], actions)
-    for spec in specs:
-        boundary_id = str(spec['boundary_id'])
-        canonical = str(spec['canonical_fake_name'])
-        return_state = str(spec.get('return_state_name') or '')
-        aliases = [name for name in spec.get('hook_targets', []) or [] if name and name != canonical]
-        if not aliases:
-            continue
-        setter = f'raca_boundary_{boundary_id}_set_hook'
-        alias_actions: List[Dict[str, str]] = []
-        for alias in aliases:
-            default_return = _default_boundary_fake_return(alias)
-            statement_pattern = re.compile(f'(?m)^(?P<indent>[ \\t]*)(?P<setter>{re.escape(setter)}\\s*\\(\\s*){re.escape(alias)}(?P<suffix>\\s*\\)\\s*;)')
-
-            def _replace_setter(match, value=default_return):
-                call = f"{match.group('indent')}{match.group('setter')}{canonical}{match.group('suffix')}"
-                if return_state and value is not None:
-                    return f"{match.group('indent')}{return_state} = {value};\n{call}"
-                return call
-            updated, count = statement_pattern.subn(_replace_setter, updated)
-            if count == 0:
-                updated = re.sub(f'\\b{re.escape(setter)}\\s*\\(\\s*{re.escape(alias)}\\s*\\)', f'{setter}({canonical})', updated)
-            if return_state:
-                for suffix in ('_errval', '_retval', '_ret', '_return', '_result', '_value'):
-                    updated = re.sub(f'\\b{re.escape(alias)}{suffix}\\b', return_state, updated)
-                for suffix in ('_errval', '_retval', '_ret', '_result', '_value'):
-                    updated = re.sub(f'\\b{re.escape(canonical)}{suffix}\\b', return_state, updated)
-            marker_updates.append((boundary_id, alias, canonical))
-            alias_actions.append({'alias': alias, 'canonical': canonical, 'default_return': default_return or ''})
-        if alias_actions:
-            actions.append({'boundary_id': boundary_id, 'original': spec.get('original', ''), 'canonical_fake_name': canonical, 'return_state_name': return_state, 'normalized_aliases': alias_actions})
-        if return_state:
-            state_aliases: List[str] = []
-            for suffix in ('_errval', '_retval', '_ret', '_result', '_value'):
-                state_alias = f'{canonical}{suffix}'
-                updated_next = re.sub(f'\\b{re.escape(state_alias)}\\b', return_state, updated)
-                if updated_next != updated:
-                    state_aliases.append(state_alias)
-                    updated = updated_next
-            if state_aliases:
-                actions.append({'boundary_id': boundary_id, 'original': spec.get('original', ''), 'canonical_fake_name': canonical, 'return_state_name': return_state, 'normalized_state_aliases': state_aliases})
-    for boundary_id, alias, canonical in marker_updates:
-        updated = re.sub(f'(RACA_MOCK\\s*:\\s*boundary={re.escape(boundary_id)}\\s*;\\s*original=[^;]+;\\s*replacement=){re.escape(alias)}\\b', f'\\1{canonical}', updated)
-    block = _build_fake_skeleton_block(specs)
-    if block:
-        updated = _insert_auto_boundary_fakes(_remove_auto_boundary_fake_blocks(updated), block)
-    if updated == original_code:
+    if 'mock_interfaces' in (scenario_context or {}):
+        # Bodies belong to the LLM. Missing implementations must not become a
+        # framework-generated constant-return fake that silently changes behavior.
+        return original_code, [], []
+    if _boundary_fake_contract_diagnostics(original_code, scenario_context):
         return (original_code, [], [])
+    specs = _boundary_hook_fake_specs(scenario_context, linux_kernel_path, missing_symbols or set(), original_code)
+    if not specs:
+        return (original_code, [], [])
+    block = _build_fake_skeleton_block(specs)
+    updated = _insert_auto_boundary_fakes(original_code, block)
+    if source_tokens(updated) == source_tokens(original_code):
+        return (original_code, [], [])
+    actions = [{'kind': 'supply_missing_canonical_fake', 'fake': spec['fake_name'], 'boundary_ids': spec['boundary_ids']} for spec in specs]
     return (updated, specs, actions)
 
 def _build_fake_skeleton_block(specs: List[Dict[str, object]]) -> str:
     if not specs:
         return ''
     lines = ['/* RACA auto boundary fake definitions BEGIN */\n', '/* Generated from compiler-reported missing fake symbols and boundary hook metadata. */\n']
+    seen = set()
     for spec in specs:
+        key = str(spec['fake_name'])
+        if key in seen:
+            continue
+        seen.add(key)
         return_type = str(spec['return_type'])
         params = str(spec['params'])
         fake_name = str(spec['fake_name'])
@@ -751,7 +724,8 @@ def _build_fake_skeleton_block(specs: List[Dict[str, object]]) -> str:
         call_count_name = spec.get('call_count_name')
         original = str(spec['original'])
         boundary_id = str(spec['boundary_id'])
-        lines.append(f'/* RACA_MOCK: boundary={boundary_id}; original={original}; replacement={fake_name} */\n')
+        for linked_id in spec.get('boundary_ids', [boundary_id]):
+            lines.append(f'/* RACA_MOCK: boundary={linked_id}; original={original}; replacement={fake_name} */\n')
         if call_count_name:
             lines.append(f'static unsigned long {call_count_name};\n')
         if return_type != 'void' and return_state_name:
@@ -766,9 +740,6 @@ def _build_fake_skeleton_block(specs: List[Dict[str, object]]) -> str:
     lines.append('/* RACA auto boundary fake definitions END */\n')
     return ''.join(lines)
 
-def _remove_auto_boundary_fake_blocks(test_code: str) -> str:
-    return re.sub('\\n?/\\* RACA auto boundary fake definitions BEGIN \\*/.*?/\\* RACA auto boundary fake definitions END \\*/\\n?', '\n', test_code or '', flags=re.DOTALL)
-
 def _insert_auto_boundary_fakes(test_code: str, block: str) -> str:
     marker = '/* ===== Flexible Helpers BEGIN ===== */'
     if marker in test_code:
@@ -777,6 +748,10 @@ def _insert_auto_boundary_fakes(test_code: str, block: str) -> str:
     if marker in test_code:
         return test_code.replace(marker, block + '\n' + marker, 1)
     return test_code.rstrip() + '\n\n' + block
+
+
+def _effective_auto_repair(before_code, candidate_code, actions):
+    return bool(actions and source_tokens(before_code) != source_tokens(candidate_code))
 
 def _auto_insert_missing_boundary_fakes(test_code: str, build_log: str, scenario_context: Dict, linux_kernel_path: str) -> Tuple[str, List[Dict[str, object]]]:
     missing = _missing_fake_symbols_from_build_log(build_log)
@@ -977,7 +952,15 @@ def main():
                 generation_history: List[Dict[str, object]] = []
                 try:
                     try:
-                        stub_result = apply_stub(StubSpec(driver_c_path=driver_file_path, target_func_name=function.name, config_symbol=f"CONFIG_{file_name.upper().replace('-', '_')}_KUNIT_TEST", mode='single', parse_result=parse_result, enable_boundary_hooks=True))
+                        prepared_registry = prepare_scenario_registry(parse_result, function, local_or_api, prompt_path, model, tokenizer)
+                        _write_json(os.path.join(function_output_dir, 'prepared_scenario_registry.json'), prepared_registry.to_dict())
+                    except Exception as context_err:
+                        log_file = _save_error_log(function_output_dir, function.name, 'prepare_scenario_registry', iteration_count, traceback.format_exc())
+                        function_summary_data = _write_function_failure_summary(function_output_dir=function_output_dir, function_name=function.name, status='scenario_context_failed', stage='prepare_scenario_registry', iteration=iteration_count, reason=str(context_err), history=generation_history, **_timing_payload(function_started_at, function_start_monotonic), error_log=log_file)
+                        driver_function_summaries.append(function_summary_data)
+                        continue
+                    try:
+                        stub_result = apply_stub(StubSpec(driver_c_path=driver_file_path, target_func_name=function.name, config_symbol=f"CONFIG_{file_name.upper().replace('-', '_')}_KUNIT_TEST", mode='single', parse_result=parse_result, enable_boundary_hooks=True, scenario_registry=prepared_registry))
                         generation_history.append({'iteration': iteration_count, 'stage': 'apply_stub', 'status': 'passed'})
                     except Exception as stub_err:
                         error_text = traceback.format_exc()
@@ -999,11 +982,18 @@ def main():
                     scenario_context_path = ''
                     scenario_context_path = os.path.join(function_output_dir, 'scenario_context.json')
                     try:
-                        scenario_context = generate_scenario_context(parse_result=parse_result, function=function, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, export_interfaces=stub_result.export_interfaces)
+                        scenario_context = generate_scenario_context(parse_result=parse_result, function=function, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, export_interfaces=stub_result.export_interfaces, registry=prepared_registry)
+                        from generation.mock_interfaces import allocate_mock_interfaces, callback_interface_specs, framework_hook_specs
+                        framework_mock_specs = framework_hook_specs(scenario_context)
+                        framework_mock_specs.extend(callback_interface_specs(scenario_context))
+                        allocate_mock_interfaces(scenario_context, framework_mock_specs)
                         save_scenario_context(scenario_context, scenario_context_path)
                         if isinstance(scenario_context, dict) and isinstance(scenario_context.get('scenario_registry'), dict):
                             _write_json(os.path.join(function_output_dir, 'scenario_registry.json'), scenario_context['scenario_registry'])
-                        _write_json(os.path.join(function_output_dir, 'scenario_context_structure_validation.json'), validate_scenario_context_structure(scenario_context).to_dict())
+                        context_structure = validate_scenario_context_structure(scenario_context)
+                        _write_json(os.path.join(function_output_dir, 'scenario_context_structure_validation.json'), context_structure.to_dict())
+                        if context_structure.errors:
+                            raise ValueError('Framework scenario context is incomplete; changing generated test bodies cannot repair it: ' + '; '.join(context_structure.errors))
                         generation_history.append({'iteration': iteration_count, 'stage': 'scenario_context', 'status': 'passed', 'scenario_context_path': scenario_context_path})
                     except Exception as context_err:
                         error_text = traceback.format_exc()
@@ -1014,7 +1004,7 @@ def main():
                         continue
                     print(f'[INFO] Scenario context 已保存至 {scenario_context_path}')
                     try:
-                        test_case = generate_test_case(parse_result, function, local_or_api, prompt_path, model, tokenizer, stub_result.export_interfaces, scenario_context=scenario_context)
+                        test_case = generate_test_case(parse_result, function, local_or_api, prompt_path, model, tokenizer, stub_result.export_interfaces, scenario_context=scenario_context, trace_path=os.path.join(function_output_dir, f'{function.name}_initial_llm_response.c'))
                         generation_history.append({'iteration': iteration_count, 'stage': 'generate_test_case', 'status': 'passed'})
                     except Exception as gen_err:
                         error_text = traceback.format_exc()
@@ -1027,6 +1017,8 @@ def main():
                     if removed_initial_externs:
                         _write_json(os.path.join(function_output_dir, f'{function.name}_initial_candidate_normalization.json'), {'removed_flexible_extern_declarations': removed_initial_externs, 'reason': 'generated extern declarations outside the fixed TEST EXPORT block are forbidden'})
                     suite_name = _extract_suite_name(test_case, f'{function.name}_test')
+                    from verification.assertion_trace import instrument_assertion_receipts
+                    test_case = instrument_assertion_receipts(test_case, scenario_context)
                     test_case_save_path = os.path.join(driver_dir_path, f'{function.name}_test_case.c')
                     kunit_config_name = f"{file_name.upper().replace('-', '_')}_KUNIT_TEST"
                     test_obj_name = f'{function.name}_test_case.o'
@@ -1045,6 +1037,14 @@ def main():
                     frozen_tests: Set[str] = set()
                     test_file_name = os.path.basename(test_case_save_path)
                     last_patch_rejection: Dict[str, object] = {}
+                    repair_state = RepairState()
+
+                    def repair_identity():
+                        return input_identity(_read_text(test_case_save_path), scenario_context, frozen_tests,
+                            [driver_file_path, makefile_path, kconfig_path, linux_config_path,
+                             os.path.join(buildroot_dir_path, '.config'),
+                             os.path.join(linux_kernel_path, 'include/config/auto.conf'),
+                             os.path.join(linux_kernel_path, 'include/generated/autoconf.h')])
 
                     def _validation_path(label: str, iteration: int) -> str:
                         return os.path.join(function_output_dir, f'{function.name}_{label}_iteration{iteration}.json')
@@ -1058,6 +1058,9 @@ def main():
                         candidate_path = os.path.join(function_output_dir, f'{function.name}_{stage}_iteration{iteration}_candidate.c')
                         diff_path = os.path.join(function_output_dir, f'{function.name}_{stage}_iteration{iteration}.patch')
                         candidate_code = candidate_code or ''
+                        from generation.mock_interfaces import reconcile_mock_declarations
+                        candidate_code, mock_declaration_errors = reconcile_mock_declarations(before_code, candidate_code, scenario_context)
+                        candidate_code = instrument_assertion_receipts(candidate_code, scenario_context)
                         if candidate_code and (not candidate_code.endswith('\n')):
                             candidate_code += '\n'
                         removed_candidate_externs = []
@@ -1077,6 +1080,12 @@ def main():
                             last_patch_rejection = {'stage': stage, 'iteration': iteration, 'reason': 'LLM candidate is identical to the current test file; no source-code changes were produced.', 'candidate': candidate_path, 'audit_diff': diff_path, 'phase': 'candidate_no_change'}
                             print(f'[WARN] {stage} 候选文件没有产生源码变化，已拒绝。')
                             return False
+                        if not inspect_test_source(candidate_code).test_functions:
+                            last_patch_rejection = {'stage': stage, 'iteration': iteration,
+                                'reason': 'Repair candidate contains no KUnit test functions; full response retained.',
+                                'candidate': candidate_path, 'audit_diff': diff_path, 'phase': 'candidate_format'}
+                            _write_json(_validation_path(f'{stage}_patch_rejected', iteration), last_patch_rejection)
+                            return False
                         gate_frozen_tests = set(frozen_tests)
                         if stage.startswith('coverage'):
                             gate_frozen_tests.update((item.name for item in inspect_test_source(before_code or '').test_functions))
@@ -1086,25 +1095,17 @@ def main():
                         poison_fake_pointer_errors = _poison_fake_pointer_diagnostics(candidate_code)
                         validation_report = {'candidate': {'candidate_file': candidate_path, 'audit_diff': diff_path, 'merge_mode': 'validated_full_file_overwrite', 'removed_flexible_extern_declarations': removed_candidate_externs}, 'gate': gate_result.to_dict(), 'scenario_context': context_result.to_dict(), 'nested_function_errors': nested_function_errors, 'poison_fake_pointer_errors': poison_fake_pointer_errors}
                         _write_json(_validation_path(f'{stage}_validation', iteration), validation_report)
-                        hard_errors = [error for error in gate_result.hard_errors if not _is_missing_scenario_binding_error(error)]
+                        # Region/frozen-test errors have already been classified by the gate.
+                        hard_errors = list(gate_result.hard_errors)
+                        hard_errors.extend(mock_declaration_errors)
                         if context_result.errors:
                             hard_errors.extend((error for error in context_result.errors if not _is_missing_scenario_binding_error(error)))
                         hard_errors.extend(nested_function_errors)
                         hard_errors.extend(poison_fake_pointer_errors)
+                        hard_errors.extend(_boundary_fake_contract_diagnostics(candidate_code, scenario_context))
                         audit = (gate_result.report or {}).get('repair_audit') or {}
-                        removed_tests = audit.get('removed_tests', []) or []
-                        added_tests = audit.get('added_tests', []) or []
-                        is_coverage_patch = stage.startswith('coverage')
-                        is_scenario_patch = stage.startswith('scenario')
                         removable_before = _removable_generated_tests(before_code, scenario_context)
-                        if is_coverage_patch and removed_tests:
-                            hard_errors.append(f'Coverage candidate removed existing test functions: {removed_tests}.')
-                        if is_scenario_patch:
-                            illegal_removed = sorted(set(removed_tests) - removable_before)
-                            if illegal_removed:
-                                hard_errors.append(f'Scenario candidate removed tests that were not unbound or inactive generated tests: {illegal_removed}.')
-                        elif not is_coverage_patch and (removed_tests or added_tests):
-                            hard_errors.append(f'Repair candidate changed the test function set; keep test names stable and modify only the implicated test bodies. removed={removed_tests}, added={added_tests}')
+                        hard_errors.extend(test_set_errors(audit, stage, removable_before))
                         if hard_errors:
                             _write_json(_validation_path(f'{stage}_patch_rejected', iteration), {'ok': False, 'hard_errors': hard_errors, 'validation': validation_report})
                             last_patch_rejection = {'stage': stage, 'iteration': iteration, 'hard_errors': hard_errors, 'validation': validation_report, 'candidate': candidate_path, 'audit_diff': diff_path, 'phase': 'validation'}
@@ -1119,6 +1120,8 @@ def main():
                     def _apply_llm_candidate_with_retry(stage: str, iteration: int, candidate_code: str, before_code: str, original_task_context: str) -> bool:
                         if _apply_llm_candidate(stage, iteration, candidate_code, before_code):
                             return True
+                        repair_state.reject(stage, before_code, last_patch_rejection)
+                        _write_json(os.path.join(function_output_dir, 'repair_rejections.json'), repair_state.rejections)
                         rejected_candidate_code = candidate_code or ''
                         rejected_candidate = _candidate_diff(before_code, rejected_candidate_code)
                         for retry_index in range(1, PATCH_RETRY_LIMIT + 1):
@@ -1126,6 +1129,8 @@ def main():
                             retry_candidate = repair_rejected_patch(function=function, current_test_case=before_code, rejected_candidate_code=rejected_candidate_code, rejected_patch=rejected_candidate, rejection_reason=rejection, failure_stage=stage, original_task_context=original_task_context, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_{stage}_retry{retry_index}_iteration{iteration}_llm_rewrite.c'))
                             if _apply_llm_candidate(f'{stage}_retry{retry_index}', iteration, retry_candidate, before_code):
                                 return True
+                            repair_state.reject(stage, before_code, last_patch_rejection)
+                            _write_json(os.path.join(function_output_dir, 'repair_rejections.json'), repair_state.rejections)
                             rejected_candidate_code = retry_candidate or ''
                             rejected_candidate = _candidate_diff(before_code, rejected_candidate_code)
                         return False
@@ -1133,8 +1138,9 @@ def main():
                     def apply_llm_fix(stage: str, error_log: str):
                         print(f'{stage} 阶段失败，正在请求 LLM 修复测试用例 ...')
                         current_test_case = _read_text(test_case_save_path)
-                        augmented_error_log = _augment_repair_log(error_log)
-                        candidate_code = refine_test_case(function=function, current_test_case=current_test_case, error_log=_condense_log(augmented_error_log), failure_stage=stage, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, frozen_tests=sorted(frozen_tests), scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_{stage}_iteration{iteration_count}_llm_rewrite.c'))
+                        augmented_error_log = repair_state.feedback(stage, current_test_case, _augment_repair_log(error_log))
+                        _write_text(os.path.join(function_output_dir, f'{function.name}_{stage}_iteration{iteration_count}_repair_feedback.log'), augmented_error_log)
+                        candidate_code = refine_test_case(function=function, current_test_case=current_test_case, error_log=augmented_error_log, failure_stage=stage, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, frozen_tests=sorted(frozen_tests), scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_{stage}_iteration{iteration_count}_llm_rewrite.c'))
                         if not _apply_llm_candidate_with_retry(stage, iteration_count, candidate_code, current_test_case, augmented_error_log):
                             return False
                         print('测试用例候选文件已写入，准备重试。')
@@ -1273,6 +1279,62 @@ def main():
                             driver_configured = True
                         else:
                             rebuild_kernel_buildroot(buildroot_dir_path)
+
+                    def apply_evaluation_feedback(outcome):
+                        nonlocal scenario_context
+                        action = outcome['action']
+                        current_test_case = _read_text(test_case_save_path)
+                        if action == 'repair_results':
+                            repair_log = '\n'.join([outcome['failure_reasons'] or 'KUnit did not report any test result.', outcome['suite_results'] or outcome['qemu_log']])
+                            return apply_llm_fix('kunit_results', repair_log)
+                        if action == 'repair_tests':
+                            kunit = outcome['kunit']
+                            failing = sorted(set(kunit.get('failed', [])) | set(kunit.get('skipped', []) or []))
+                            feedback = repair_state.feedback('failed_tests', current_test_case, _augment_repair_log(outcome['failure_reasons'] or '(no details)'))
+                            _write_text(os.path.join(function_output_dir, f'{function.name}_failed_tests_iteration{iteration_count}_repair_feedback.log'), feedback)
+                            candidate = fix_failed_tests(function=function, current_test_case=current_test_case, failing_tests=failing, failure_reasons=feedback, frozen_tests=sorted(frozen_tests), local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_failed_tests_iteration{iteration_count}_llm_rewrite.c'))
+                            return _apply_llm_candidate_with_retry('failed_tests', iteration_count, candidate, current_test_case, feedback)
+                        if action == 'repair_scenarios':
+                            return apply_llm_fix('scenario', scenario_status_repair_log(outcome['scenario_status']))
+                        if not outcome['coverage_ok'] and outcome['coverage_feedback_available']:
+                            coverage = outcome['coverage']
+                            missed_lines = coverage.get('missed_lines', [])
+                            missed_branches = coverage.get('missed_branches', [])
+                            accepted_context = scenario_context
+                            accepted = False
+                            try:
+                                source_lines, source_branches = map_feedback(parser, parse_result.source_code,
+                                    _read_text(instrumented_driver_path), function.name, missed_lines, missed_branches)
+                                _write_json(os.path.join(function_output_dir, f'{function.name}_coverage_source_mapping_iteration{iteration_count}.json'),
+                                    {'original_lines': source_lines, 'compiled_branches': source_branches})
+                                scenario_context, added_contracts = expand_scenario_context_for_coverage(accepted_context, missed_lines=source_lines, missed_branches=source_branches)
+                                allocate_mock_interfaces(scenario_context, framework_mock_specs)
+                                coverage_targets = scenario_context.get('coverage_targets', []) or []
+                                if added_contracts or coverage_targets:
+                                    _write_json(os.path.join(function_output_dir, f'{function.name}_coverage_added_scenarios_iteration{iteration_count}.json'), {'added_contracts': added_contracts, 'coverage_targets': coverage_targets, 'scenario_registry': scenario_context.get('scenario_registry', {})})
+                                line_details = _format_line_snippets(instrumented_driver_path, missed_lines)
+                                branch_lines = sorted({b.get('line') for b in missed_branches if isinstance(b, dict) and b.get('line')})
+                                snippets = {}
+                                for snippet in _format_line_snippets(instrumented_driver_path, branch_lines):
+                                    parts = snippet.split(': ', 1)
+                                    try:
+                                        snippets[int(parts[0])] = parts[1] if len(parts) > 1 else snippet
+                                    except ValueError:
+                                        continue
+                                branch_details = [missed_branch_feedback(b, snippets.get(b.get('line'), '')) for b in missed_branches if isinstance(b, dict)]
+                                rejection_feedback = repair_state.feedback('coverage', current_test_case, '')
+                                feedback = '\n'.join(line_details + branch_details + ([rejection_feedback] if rejection_feedback else []))
+                                _write_text(os.path.join(function_output_dir, f'{function.name}_coverage_iteration{iteration_count}_repair_feedback.log'), feedback)
+                                candidate = extend_coverage_tests(function=function, current_test_case=current_test_case, missed_line_details=line_details, missed_branch_details=branch_details, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_coverage_iteration{iteration_count}_llm_rewrite.c'), repair_feedback=rejection_feedback)
+                                accepted = _apply_llm_candidate_with_retry('coverage', iteration_count, candidate, current_test_case, feedback)
+                                if accepted:
+                                    save_scenario_context(scenario_context, scenario_context_path)
+                                return accepted
+                            finally:
+                                if not accepted:
+                                    scenario_context = accepted_context
+                        return None
+
                     while iteration_count <= MAX_FIX_ATTEMPTS:
                         current_prebuild_source = _read_text(test_case_save_path)
                         normalized_prebuild_source, removed_prebuild_externs = strip_flexible_extern_declarations(current_prebuild_source, scenario_context)
@@ -1288,6 +1350,7 @@ def main():
                             current_prebuild_source = boundary_fake_normalized_source
                         prebuild_scenario_validation = validate_test_against_scenario_context(current_prebuild_source, scenario_context)
                         prebuild_blocking_errors = blocking_scenario_static_errors([error for error in prebuild_scenario_validation.errors if error])
+                        prebuild_blocking_errors.extend(_boundary_fake_contract_diagnostics(current_prebuild_source, scenario_context))
                         prebuild_audit_findings = nonblocking_scenario_static_findings([error for error in prebuild_scenario_validation.errors if error])
                         if prebuild_scenario_validation.errors or prebuild_scenario_validation.warnings:
                             _write_json(_validation_path('scenario_prebuild_validation', iteration_count), prebuild_scenario_validation.to_dict())
@@ -1297,12 +1360,36 @@ def main():
                             record_history_event('scenario', iteration_count, 'blocking_static_issue_before_build', errors=prebuild_blocking_errors)
                             snapshot_test_case(iteration_count)
                             if iteration_count >= MAX_FIX_ATTEMPTS:
-                                write_summary('scenario_static_blocked', empty_kunit_summary(), empty_coverage_summary(), iteration_count, '\n'.join(prebuild_blocking_errors))
+                                terminal_failure_summary('scenario_static_blocked', iteration_count, 'scenario', '\n'.join(prebuild_blocking_errors))
                                 break
+                            repair_state.clear()
                             if not apply_llm_fix('scenario', 'Blocking static scenario issues before build:\n' + '\n'.join(prebuild_blocking_errors)):
                                 record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='scenario', rejection=last_patch_rejection)
                                 iteration_count += 1
                                 continue
+                            iteration_count += 1
+                            continue
+                        continuation = repair_state.continuation(repair_identity())
+                        if continuation:
+                            pending = continuation['payload']
+                            origin = continuation['source_iteration']
+                            record_history_event('repair', iteration_count, 'continued_from_rejected_candidate', repair_stage=pending['stage'], evidence_iteration=origin, unchanged_inputs=True)
+                            if iteration_count >= MAX_FIX_ATTEMPTS:
+                                terminal_failure_summary('repair_attempts_exhausted', iteration_count, pending['stage'], last_patch_rejection)
+                                break
+                            if pending['mode'] == 'fix':
+                                updated = apply_llm_fix(pending['stage'], pending['problem'])
+                            else:
+                                try:
+                                    updated = apply_evaluation_feedback(pending['outcome'])
+                                except CoverageFeedbackMappingError as error:
+                                    terminal_failure_summary('coverage_feedback_mapping_failed', iteration_count, 'coverage_source_mapping', str(error))
+                                    break
+                            if updated:
+                                repair_state.clear()
+                            else:
+                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage=pending['stage'], rejection=last_patch_rejection)
+                                repair_state.defer(repair_identity(), pending, origin)
                             iteration_count += 1
                             continue
                         try:
@@ -1316,44 +1403,38 @@ def main():
                             _write_text(summary_path, summary_text)
                             record_history_event('build', iteration_count, 'failed', log_file=log_file, summary_log=summary_path)
                             snapshot_test_case(iteration_count)
-                            auto_build_passed = False
                             if iteration_count < MAX_FIX_ATTEMPTS:
                                 current_source_for_auto_repair = _read_text(test_case_save_path)
                                 auto_repaired_source, inserted_fake_specs = _auto_insert_missing_boundary_fakes(current_source_for_auto_repair, summary_text, scenario_context, linux_kernel_path)
-                                auto_repaired_source, auto_repairs = _auto_repair_hook_fake_signatures(auto_repaired_source, summary_text)
+                                auto_repairs = []
+                                if 'mock_interfaces' not in scenario_context:
+                                    auto_repaired_source, auto_repairs = _auto_repair_hook_fake_signatures(auto_repaired_source, summary_text)
                                 auto_actions = []
                                 if inserted_fake_specs:
                                     auto_actions.append({'kind': 'insert_missing_boundary_fakes', 'specs': inserted_fake_specs})
                                 if auto_repairs:
                                     auto_actions.append({'kind': 'repair_hook_fake_signatures', 'repairs': auto_repairs})
-                                if auto_actions and auto_repaired_source != current_source_for_auto_repair:
+                                if _effective_auto_repair(current_source_for_auto_repair, auto_repaired_source, auto_actions):
                                     auto_diff = _candidate_diff(current_source_for_auto_repair, auto_repaired_source)
                                     auto_repair_path = os.path.join(function_output_dir, f'{function.name}_build_auto_repair_iteration{iteration_count}.json')
                                     _write_json(auto_repair_path, {'stage': 'build', 'iteration': iteration_count, 'actions': auto_actions, 'diff': auto_diff, 'reason': 'compiler-reported missing boundary fake symbols or hook setter function pointer type'})
                                     _write_text(test_case_save_path, auto_repaired_source)
                                     record_history_event('build', iteration_count, 'auto_repaired_boundary_fakes', actions=auto_actions, repair_log=auto_repair_path)
-                                    try:
-                                        run_build_step()
-                                    except subprocess.CalledProcessError as auto_exc:
-                                        auto_error_log = _collect_process_error(auto_exc)
-                                        auto_log_file = _save_error_log(function_output_dir, function.name, 'build_after_auto_repair', iteration_count, auto_error_log)
-                                        summary_text = _extract_error_summary(auto_error_log)
-                                        auto_summary_path = os.path.join(function_output_dir, f'{function.name}_build_after_auto_repair_iteration{iteration_count}_summary.log')
-                                        _write_text(auto_summary_path, summary_text)
-                                        record_history_event('build', iteration_count, 'auto_repair_failed', log_file=auto_log_file, summary_log=auto_summary_path)
-                                    else:
-                                        record_history_event('build', iteration_count, 'passed_after_auto_repair')
-                                        auto_build_passed = True
-                            if not auto_build_passed:
-                                if iteration_count >= MAX_FIX_ATTEMPTS:
-                                    build_failed_summary(iteration_count, summary_text)
-                                    break
-                                if not apply_llm_fix('build', summary_text):
-                                    record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='build', rejection=last_patch_rejection)
                                     iteration_count += 1
                                     continue
+                                if auto_actions:
+                                    record_history_event('build', iteration_count, 'auto_repair_no_effect', actions=auto_actions)
+                            if iteration_count >= MAX_FIX_ATTEMPTS:
+                                build_failed_summary(iteration_count, summary_text)
+                                break
+                            if not apply_llm_fix('build', error_log):
+                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='build', rejection=last_patch_rejection)
+                                if source_build_failure(error_log):
+                                    repair_state.defer(repair_identity(), {'mode': 'fix', 'stage': 'build', 'problem': error_log}, iteration_count)
                                 iteration_count += 1
                                 continue
+                            iteration_count += 1
+                            continue
                         print('Qemu 配置完毕')
                         coverage_summary = empty_coverage_summary()
                         kunit_summary = empty_kunit_summary()
@@ -1373,7 +1454,7 @@ def main():
                             if iteration_count >= MAX_FIX_ATTEMPTS:
                                 terminal_failure_summary('qemu_failed', iteration_count, 'qemu', _condense_log(log_text))
                                 break
-                            if not apply_llm_fix('qemu', _condense_log(log_text)):
+                            if not apply_llm_fix('qemu', log_text):
                                 record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='qemu', rejection=last_patch_rejection)
                                 iteration_count += 1
                                 continue
@@ -1393,6 +1474,7 @@ def main():
                             print('[GCOV] {name} - blocks: {blocks:.1f}%, lines: {lines:.1f}% ({hit}/{total}), branches: {branches:.1f}% ({bhit}/{btotal})'.format(name=function.name, blocks=coverage_summary['blocks_percent'], lines=coverage_summary['line_percent'], hit=coverage_summary['line_hit'], total=coverage_summary['line_total'], branches=coverage_summary['branch_percent'], bhit=coverage_summary['branch_hit'], btotal=coverage_summary['branch_total']))
                         except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as err:
                             print(f'[GCOV] 覆盖率收集失败: {err}')
+                            coverage_summary['measurement'] = {'policy': 'verified-original-function-v2', 'valid': False, 'line_valid': False, 'branch_valid': False, 'branch_applicable': None, 'status': 'unresolved', 'reason_codes': ['counter_collection_failed'], 'reason': str(err)}
                         suite_results_text = ''
                         if os.path.exists(suite_results_host_path):
                             try:
@@ -1447,102 +1529,37 @@ def main():
                         remember_metrics_checkpoint(kunit_summary, coverage_summary, iteration_count, failure_reason_text, latest_fixed_manifest_path, current_mutation_ready_manifest_path)
                         record_history_event('results', iteration_count, 'recorded', kunit=kunit_summary, coverage=coverage_summary, failing_tests=failing_tests, failure_reasons=failure_reason_text, scenario_status=scenario_runtime_status, scenario_test_bindings=scenario_bindings, metrics_ready=metrics_ready_now, fixed_tests_manifest=fixed_manifest_path, mutation_ready=mutation_ready_now, test_case=snapshot_path, qemu_log=current_qemu_log)
                         frozen_tests.update(stable_tests_from_scenario_status(scenario_runtime_status))
-                        coverage_ok = coverage_summary.get('line_percent', 0.0) >= TARGET_COVERAGE_PERCENT and coverage_summary.get('branch_percent', 0.0) >= TARGET_COVERAGE_PERCENT
-                        coverage_feedback_available = bool(kunit_results_available and (coverage_summary.get('line_total', 0) or coverage_summary.get('branch_total', 0) or coverage_summary.get('missed_lines') or coverage_summary.get('missed_branches')))
-                        if coverage_ok and metrics_ready_now and kunit_pass_ok:
+                        coverage_ok = coverage_target_met(coverage_summary, TARGET_COVERAGE_PERCENT)
+                        next_action = evaluation_action(kunit_summary, coverage_summary, TARGET_COVERAGE_PERCENT, scenarios_complete=scenario_complete)
+                        record_history_event('decision', iteration_count, next_action, measurement=coverage_summary.get('measurement', {}))
+                        coverage_feedback_available = bool(coverage_summary.get('measurement', {}).get('valid', True) and kunit_results_available and (coverage_summary.get('line_total', 0) or coverage_summary.get('branch_total', 0) or coverage_summary.get('missed_lines') or coverage_summary.get('missed_branches')))
+                        if next_action == 'complete':
                             write_summary('completed', kunit_summary, coverage_summary, iteration_count, failure_reason_text)
                             break
+                        if next_action == 'measurement_review':
+                            write_summary('measurement_review', kunit_summary, coverage_summary, iteration_count, 'Coverage attribution is unresolved; preserved counters require measurement review, not new tests.')
+                            break
                         if iteration_count >= MAX_FIX_ATTEMPTS:
-                            if metrics_ready_now and coverage_ok:
+                            if metrics_ready_now and coverage_ok and scenario_complete:
                                 status = 'completed_with_test_failures' if not kunit_pass_ok else 'completed'
                             else:
                                 status = 'iteration_exhausted_with_metrics' if metrics_ready_now else 'iteration_exhausted'
                             write_summary(status, kunit_summary, coverage_summary, iteration_count, failure_reason_text)
                             break
-                        current_test_case = _read_text(test_case_save_path)
-                        updated = False
-                        if not kunit_results_available:
-                            repair_log = '\n'.join([failure_reason_text or 'KUnit did not report any test result.', _condense_log(suite_results_text or qemu_log_text)])
-                            if apply_llm_fix('kunit_results', repair_log):
-                                updated = True
-                                iteration_count += 1
-                                continue
-                            else:
-                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='kunit_results', rejection=last_patch_rejection)
-                                iteration_count += 1
-                                continue
-                        if kunit_results_available and failing_tests:
-                            augmented_failure_reasons = _augment_repair_log(failure_reason_text or '(no details)')
-                            candidate_code = fix_failed_tests(function=function, current_test_case=current_test_case, failing_tests=failing_tests, failure_reasons=augmented_failure_reasons, frozen_tests=sorted(frozen_tests) if frozen_tests else [], local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_failed_tests_iteration{iteration_count}_llm_rewrite.c'))
-                            if _apply_llm_candidate_with_retry('failed_tests', iteration_count, candidate_code, current_test_case, augmented_failure_reasons):
-                                updated = True
-                                iteration_count += 1
-                                continue
-                            record_history_event('repair', iteration_count, 'pass_rate_patch_rejected_continue_to_coverage', repair_stage='failed_tests', rejection=last_patch_rejection)
-                            if coverage_ok:
-                                write_summary('completed_with_test_failures', kunit_summary, coverage_summary, iteration_count, failure_reason_text)
-                                break
-                        if not failing_tests and (not scenario_complete):
-                            scenario_repair_log = scenario_status_repair_log(scenario_runtime_status)
-                            if apply_llm_fix('scenario', scenario_repair_log):
-                                updated = True
-                                iteration_count += 1
-                                continue
-                            else:
-                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='scenario', rejection=last_patch_rejection)
-                                iteration_count += 1
-                                continue
-                        if not coverage_ok and coverage_feedback_available:
-                            missed_lines = coverage_summary.get('missed_lines', [])
-                            missed_branches = coverage_summary.get('missed_branches', [])
-                            added_contracts = []
-                            added_ids = set()
-                            scenario_context, added_contracts = expand_scenario_context_for_coverage(scenario_context, missed_lines=missed_lines, missed_branches=missed_branches)
-                            coverage_targets = scenario_context.get('coverage_targets', []) or []
-                            if added_contracts or coverage_targets:
-                                _write_json(os.path.join(function_output_dir, f'{function.name}_coverage_added_scenarios_iteration{iteration_count}.json'), {'added_contracts': added_contracts, 'coverage_targets': coverage_targets, 'scenario_registry': scenario_context.get('scenario_registry', {})})
-                                save_scenario_context(scenario_context, scenario_context_path)
-                            added_ids = {contract.get('scenario_id') for contract in added_contracts if isinstance(contract, dict) and contract.get('scenario_id')}
-                            missed_line_details = _format_line_snippets(instrumented_driver_path, missed_lines)
-                            branch_lines = sorted({b.get('line') for b in missed_branches if isinstance(b, dict) and b.get('line')})
-                            branch_snippet_map = {}
-                            if branch_lines:
-                                for snippet in _format_line_snippets(instrumented_driver_path, branch_lines):
-                                    parts = snippet.split(': ', 1)
-                                    line_no = None
-                                    try:
-                                        line_no = int(parts[0]) if parts else None
-                                    except ValueError:
-                                        line_no = None
-                                    if line_no is not None:
-                                        branch_snippet_map[line_no] = parts[1] if len(parts) > 1 else snippet
-                            missed_branch_details = []
-                            for b in missed_branches:
-                                if not isinstance(b, dict):
-                                    continue
-                                line_no = b.get('line')
-                                branch_idx = b.get('branch_index')
-                                branch_desc = ''
-                                if branch_idx == 0:
-                                    branch_desc = 'false-path not covered (branch_index 0)'
-                                elif branch_idx == 1:
-                                    branch_desc = 'true-path not covered (branch_index 1)'
-                                desc = f'{branch_desc}'
-                                code = branch_snippet_map.get(line_no)
-                                if code:
-                                    desc += f' => {code}\n'
-                                missed_branch_details.append(desc)
-                            coverage_before_code = _read_text(test_case_save_path)
-                            candidate_code = extend_coverage_tests(function=function, current_test_case=coverage_before_code, missed_line_details=missed_line_details, missed_branch_details=missed_branch_details, local_or_api=local_or_api, prompt_path=prompt_path, model=model, tokenizer=tokenizer, scenario_context=scenario_context, test_file_name=test_file_name, trace_path=os.path.join(function_output_dir, f'{function.name}_coverage_iteration{iteration_count}_llm_rewrite.c'))
-                            if _apply_llm_candidate_with_retry('coverage', iteration_count, candidate_code, coverage_before_code, '\n'.join((missed_line_details or []) + (missed_branch_details or []))):
-                                updated = True
-                            elif updated:
-                                record_history_event('coverage', iteration_count, 'patch_rejected_after_prior_update', rejection=last_patch_rejection)
-                            else:
-                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage='coverage', rejection=last_patch_rejection)
-                                iteration_count += 1
-                                continue
-                        if updated:
+                        outcome = {'action': next_action, 'kunit': kunit_summary, 'coverage': coverage_summary,
+                            'scenario_status': scenario_runtime_status, 'failure_reasons': failure_reason_text,
+                            'suite_results': suite_results_text, 'qemu_log': qemu_log_text,
+                            'coverage_ok': coverage_ok, 'coverage_feedback_available': coverage_feedback_available}
+                        try:
+                            updated = apply_evaluation_feedback(outcome)
+                        except CoverageFeedbackMappingError as error:
+                            terminal_failure_summary('coverage_feedback_mapping_failed', iteration_count, 'coverage_source_mapping', str(error))
+                            break
+                        if updated is not None:
+                            if not updated:
+                                repair_stage = {'repair_results': 'kunit_results', 'repair_tests': 'failed_tests', 'repair_scenarios': 'scenario'}.get(next_action, 'coverage')
+                                record_history_event('repair', iteration_count, 'patch_rejected', repair_stage=repair_stage, rejection=last_patch_rejection)
+                                repair_state.defer(repair_identity(), {'mode': 'evaluation', 'stage': repair_stage, 'outcome': outcome}, iteration_count)
                             iteration_count += 1
                             continue
                         write_summary('iteration_stalled', kunit_summary, coverage_summary, iteration_count, failure_reason_text or 'No applicable repair or coverage feedback was available.')

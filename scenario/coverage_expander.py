@@ -1,7 +1,9 @@
 import hashlib
+from copy import deepcopy
 from typing import Dict, Iterable, List, Set, Tuple
 
 from scenario.contract_revision import append_revision
+from scenario.condition_variants import initialize_variants, make_variant, append_variant
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -15,38 +17,45 @@ def _registry(context: Dict) -> Dict:
 
 
 def _fact_for_line(facts: List[Dict], line: int):
+    scopes = []
     for fact in facts:
         start = int(fact.get("start_line") or 0)
         end = int(fact.get("end_line") or start)
         if start <= line <= end:
+            if fact.get('kind') in {'SWITCH', 'FUNCTION'}:
+                scopes.append(fact)
+                continue
             return fact
-    return None
+    return min(scopes, key=lambda f: (f.get('kind') == 'FUNCTION', int(f['end_line']) - int(f['start_line']))) if scopes else None
 
 
 def _fact_for_branch(facts: List[Dict], branch: Dict):
     if not isinstance(branch, dict) or not branch.get("line"):
         return None
     line = int(branch.get("line") or 0)
-    branch_index = branch.get("branch_index")
-    expected_edge = None
-    if branch_index == 0:
-        expected_edge = "fallthrough"
-    elif branch_index == 1:
-        expected_edge = "branch"
-    candidates = []
-    for fact in facts:
-        if fact.get("kind") != "BRANCH_EDGE":
-            continue
-        start = int(fact.get("start_line") or 0)
-        end = int(fact.get("end_line") or start)
-        if not (start <= line <= end):
-            continue
-        if expected_edge and (fact.get("metadata", {}) or {}).get("edge") != expected_edge:
-            continue
-        candidates.append(fact)
+    # GCOV indices (and its fallthrough flag) are compiler edges, not C truth values.
+    mapping = branch.get("source_mapping") or {}
+    if mapping.get("verified") and mapping.get("evidence_ids"):
+        for fact in facts:
+            if fact.get("fact_id") == mapping.get("source_fact_id"):
+                return fact
+    if mapping.get('verified') and 'original_lines' in mapping:
+        original_lines = mapping['original_lines']
+        if not original_lines:
+            return None
+        first, last = min(original_lines), max(original_lines)
+        controls = [f for f in facts if f.get('kind') in {'GUARD', 'LOOP', 'SWITCH'}
+                    and int(f.get('start_line') or 0) <= first and last <= int(f.get('end_line') or 0)]
+        if controls:
+            return min(controls, key=lambda f: int(f['end_line']) - int(f['start_line']))
+        matches = [_fact_for_line([f for f in facts if f.get('kind') != 'BRANCH_EDGE'], origin) for origin in original_lines]
+        matched = {f['fact_id']: f for f in matches if f is not None}
+        return next(iter(matched.values())) if len(matched) == 1 else None
+    candidates = [fact for fact in facts if fact.get("kind") in {"GUARD", "LOOP", "SWITCH"}
+                  and int(fact.get("start_line") or 0) <= line <= int(fact.get("end_line") or 0)]
     if candidates:
-        return candidates[0]
-    return _fact_for_line(facts, line)
+        return min(candidates, key=lambda fact: int(fact['end_line']) - int(fact['start_line']))
+    return _fact_for_line([fact for fact in facts if fact.get("kind") != "BRANCH_EDGE"], line)
 
 
 def _anchored_fact_ids(registry: Dict) -> Set[str]:
@@ -84,6 +93,13 @@ def _active_scenario_set(registry: Dict) -> Set[str]:
 
 def _contract_for_existing_fact(registry: Dict, fact: Dict):
     fact_id = fact.get("fact_id", "")
+    if fact.get("kind") in {"GUARD", "LOOP", "SWITCH"}:
+        # Without edge mapping, a guard-return scenario may impose the *opposite*
+        # outcome. Reuse only a direction-neutral coverage contract for this anchor.
+        for contract in registry.get("scenario_contracts", []) or []:
+            if contract.get("derivation") == "coverage_feedback:uncovered_source_fact" and fact_id in contract.get("source_anchors", []):
+                return contract
+        return None
     direct = _existing_contract_for_fact(registry, fact_id)
     if direct is not None:
         return direct
@@ -474,7 +490,12 @@ def _contract_for_fact(registry: Dict, fact: Dict) -> Dict:
     scenario_id = f"{target}:coverage:{_stable_id('A', fact_id)}"
     kind = fact.get("kind", "")
     metadata = fact.get("metadata", {}) or {}
-    checks: List[Dict] = []
+    checks: List[Dict] = [{
+        "check_id": _stable_id("CHK", scenario_id, "observable"),
+        "kind": "ObservableEffect", "target": "target_result_or_state",
+        "expected_relation": "derive a target-visible return/output/state or interaction assertion for the chosen inputs and the uncovered source behavior; edge numbering does not imply predicate truth",
+        "evidence_ids": [fact_id],
+    }]
     witnesses: List[Dict] = []
     observations: List[Dict] = []
     boundary = _boundary_for_fact(registry, fact_id)
@@ -510,19 +531,13 @@ def _contract_for_fact(registry: Dict, fact: Dict) -> Dict:
         if not boundary_id or boundary_id in existing_boundary_ids:
             continue
         constraint, witness = _boundary_completion_constraint(registry, scenario_id, downstream_boundary, fact)
+        # Related does not imply executed. Preserve environment guidance, but
+        # do not require mutually exclusive downstream calls to occur together.
+        constraint["conditional"] = True
+        constraint["runtime_witnesses"] = []
         hardware_constraints.append(constraint)
-        witnesses.append(witness)
         dependent_boundaries.append(boundary_id)
         existing_boundary_ids.add(boundary_id)
-        checks.append(
-            {
-                "check_id": _stable_id("CHK", scenario_id, boundary_id, "completion"),
-                "kind": "BoundaryCalledForCoverageCompletion",
-                "target": boundary_id,
-                "expected_relation": "boundary call_count >= 1 if the coverage path reaches code after the anchored source fact",
-                "evidence_ids": downstream_boundary.get("fact_ids", []) or [fact_id],
-            }
-        )
 
     return {
         "scenario_id": scenario_id,
@@ -555,6 +570,9 @@ def expand_scenario_context_for_coverage(
     missed_lines: Iterable[int],
     missed_branches: Iterable[Dict],
 ) -> Tuple[Dict, List[Dict]]:
+    # A proposal must not mutate the accepted registry before its tests pass the gate.
+    scenario_context = deepcopy(scenario_context)
+    initialize_variants(scenario_context)
     registry = _registry(scenario_context)
     facts = registry.get("source_facts", []) or []
     anchored = _anchored_fact_ids(registry)
@@ -608,7 +626,7 @@ def expand_scenario_context_for_coverage(
                 )
             anchored.add(fact["fact_id"])
             continue
-        if fact.get("fact_id") in anchored:
+        if fact.get("fact_id") in anchored and fact.get("kind") not in {"GUARD", "LOOP", "SWITCH"}:
             continue
         contract = _contract_for_fact(registry, fact)
         if contract["scenario_id"] in existing_ids:
@@ -633,6 +651,22 @@ def expand_scenario_context_for_coverage(
             )
 
     scenario_context["coverage_targets"] = coverage_targets
+
+    contracts = {c["scenario_id"]: c for c in registry.get("scenario_contracts", [])}
+    facts_by_id = _fact_by_id(registry)
+    for target in coverage_targets:
+        variant = make_variant(contracts[target["scenario_id"]], target["variant_id"])
+        fact = facts_by_id[target["source_fact_id"]]
+        metadata = fact.get("metadata", {})
+        # Only a source-proven edge can imply a truth value. GCOV indices cannot.
+        requirements = metadata.get("requirements", []) if fact.get("kind") == "BRANCH_EDGE" else []
+        instruction = ("exercise " + fact.get("code", "") + "; source requirements: " + repr(requirements)
+                       if requirements else "exercise the recorded uncovered behavior: " + fact.get("code", ""))
+        variant.setdefault("trigger_conditions", []).append({
+            "condition_id": _stable_id("COND", target["target_id"]),
+            "expression": instruction, "evidence_ids": [fact["fact_id"]]})
+        variant["coverage_evidence"] = deepcopy(target)
+        append_variant(scenario_context, variant)
 
     if added or coverage_targets:
         scenario_context["active_scenario_ids"] = list(registry.get("active_scenario_ids", []) or [])

@@ -40,13 +40,15 @@ test_case_generate_prompt: |
   Generate the flexible body of Linux KUnit tests for the target driver function.
 
   Hard rules:
-  - Call driver logic only through TEST EXPORT interfaces. Do not call, redefine, wrap, or mock any TEST EXPORT interface.
+  - Call driver logic only through TEST EXPORT interfaces. Do not redefine, wrap, or mock any TEST EXPORT interface.
   - Do not reference original driver-local functions or inaccessible driver symbols directly.
   - Do not define a function with the same name as the target function or any function listed in `internal_call_closure`; those are original driver functions, not test-local fakes.
   - The framework will assemble fixed sections: includes, copied driver-local definitions, extern declarations, KUnit suite registration, and MODULE metadata.
   - Do NOT output #include directives, extern declarations, KUnit suite structs, KUNIT_CASE arrays, suite init/exit hooks, or MODULE_* declarations.
   - Do NOT repeat TEST EXPORT prototypes such as `extern ... <target>_test_export(...)`; those declarations already exist in the fixed TEST EXPORT section. Call the wrapper directly.
-  - Each scenario must be implemented by its own `static void <name>(struct kunit *test)`.
+  - Each planned condition variant must have its own `static void <name>(struct kunit *test)` bound to that scenario and variant. Use its complete contract from `scenario_variants`; the scenario anchor alone does not determine its trigger, boundary behavior or expected checks.
+  - A condition variant may use multiple concrete input/output examples inside its test, with fresh setup and an independent expected observation for each call. Keep every example inside the variant's trigger requirements. Do not restrict a numeric or state-dependent behavior to one convenient input merely because its source line or branch is covered.
+  - Derive representative input distinctions from the original source and helper/macro definitions: applicable range limits, transition values, rounding behavior, bit preservation and observable state changes. Do not invent a new scenario or use mutation results as test requirements. Unresolved expected behavior must remain unresolved rather than replaced by a plausible-value assertion.
   - Allocate KUnit memory with the provided `struct kunit *test`; do not call non-existent helpers such as `current_kunit()`.
   - Do not use suite-level `.init` or `.exit`; put required setup inside each test or a helper called by the test.
   - Helpers/fakes/setup code must be used by at least one test; dead fake code is invalid.
@@ -69,6 +71,7 @@ test_case_generate_prompt: |
   - Use range, inequality, or sibling-input comparison only when no grounded exact value is available. Do not use broad `EXPECT_NE`, `>= 0`, or `<= max` checks as the only semantic assertion unless the listed scenario observation is explicitly about that relation.
   - For calculation, conversion, lookup, checksum, clamp, and boolean/path scenarios, generate concrete input-output assertions from the target code instead of checking only that the function returns a plausible value.
   - For hardware-boundary scenarios, assert both the boundary witness/effect and the target-visible semantic effect, such as exact wrapper return, propagated error, output parameter, state update, skipped follow-up boundary, or boundary argument value. Boundary call count alone is not enough.
+  - Design the input, boundary behavior, and expected observation together: explain the relationship in a short test comment, then implement it. Compute expected values independently of the value being checked; never copy the actual result into the expected value. Do not overwrite an output, driver field, or captured boundary argument between the target call and its assertion. Taking a snapshot of the actual result is allowed.
   - Every generated `static void ... (struct kunit *test)` that is intended to be registered must contain exactly one `RACA_SCENARIO` marker.
 
   Target function:
@@ -86,16 +89,19 @@ test_case_generate_prompt: |
 
   Boundary environment rules:
   - `environment_constraints` describe the boundary call point, preconditions, required effects, and runtime witnesses. They do not prescribe a fixed mock technique.
+  - Allocated `mock_interfaces` may include conditional dependencies in the target/helper closure. `required_by_contract: false` means available if that path executes, not a requirement to invoke it. Never invent a reachability witness for an unused interface.
   - When `boundary_controls` provides a hook setter for a direct external CALL boundary,
     use the exported setter/clearer/call-count interface to install a file-scope fake function. Do not define a same-name replacement for the original API.
-  - For each hook-controlled direct boundary, use only the framework-owned canonical fake
-    name derived from the original API (`fake_<original_api_name>`, with non-identifier
-    characters replaced by `_`) and its file-scope state such as
-    `fake_<original_api_name>_return`. You may edit that canonical fake implementation
-    and its state assignments, but you must not declare, define, or pass newly invented
-    mock variants such as `_success`, `_ok`, `_positive`, `_negative`, `_error`, or
-    `_errval` helpers to the hook setter. Express success/error behavior by assigning the
-    canonical return/output state before installing the canonical fake.
+  - `mock_interfaces` lists framework-allocated fake names and exact signatures for each
+    scenario/variant. Implement the corresponding body, without changing the declaration.
+    Initialize its state explicitly in each test, model required output writes as well as
+    returns, and capture arguments used by semantic checks. A return value alone does not
+    implement an output-parameter effect. Do not invent alternative mock interfaces.
+    Use a separate allocated slot for a new variant when an existing fake is frozen.
+    Callback object paths retain their source-declared types; initialize every required
+    containing object, not just the terminal function pointer. Never replace an internal helper.
+  - A mock declaration or RACA_MOCK comment is not an installation. Connect each needed fake through the provided setter or the actual callback object passed into the target, before calling the target. A different test's setup does not apply to this test.
+  - Reset every fake's mutable test-owned state (configured results, output payloads, captured arguments, counters and sequence positions) before use in each test. The framework clears its direct-boundary hooks and counters before and after every test, including assertion-abort paths; it does not initialize your fake state or guess its behavior.
   - A fake installed through a hook setter must be type-compatible with the setter
     parameter `typeof(<original_api>) *hook`: same return type, same parameter count,
     same parameter types, and same const qualifiers. Do not cast the fake function to
@@ -195,7 +201,8 @@ test_case_fix_prompt: |
   - Modify existing test functions to fix errors.
   - Add ordinary setup helpers for driver objects IF required by the error log.
   - Define helper control state locally only for ordinary setup helpers and hook-installed boundary fakes. Do not call or declare external harness/control functions that are not already present in TEST EXPORT interfaces.
-  - Update test suite init/exit logic ONLY if necessary to satisfy scenario preconditions.
+  - Keep suite registration/init/exit unchanged. Put setup and cleanup in the editable test or its non-frozen helpers.
+  - Preserve the input -> boundary behavior -> expected target observation relationship when fixing a test. Do not make a failure disappear by overwriting the actual result, copying it into the expected value, or disconnecting its mock. Initialize mutable fake state in each test; preserve the fixed framework hook lifecycle even on assertion-abort paths.
   - Fix object initialization, callable boundary setup, output parameter setup, NULL pointer
     setup, and runtime environment modeling required by the scenario contract.
   - When fixing a runtime crash, repair the environment object graph that the production
@@ -256,6 +263,9 @@ test_case_fix_prompt: |
   - During scenario-stage repair, remove registered KUnit tests only when they have no
     RACA_SCENARIO binding or bind an inactive/unknown scenario. Do not remove a test merely
     because its scenario reaches a hardware/environment boundary.
+  - If the current file has no tests, or an active scenario has no corresponding test,
+    add the missing scenario-bound tests and register them. This is supplementation,
+    not permission to delete, rename, or replace existing or frozen tests.
 
   You MUST NOT:
   - Rewrite or regenerate the test file from scratch.
@@ -282,7 +292,7 @@ test_case_fix_prompt: |
   - Change a scenario trigger into a different scenario.
   - Catch, hide, or bypass a crash without fixing the required hardware/environment constraint.
   - Modify tests whose scenario status is already PASSED.
-  - Split one scenario across multiple test functions or bind multiple test functions to the same scenario.
+  - Combine multiple scenarios in one test. A scenario may have multiple planned condition variants with distinct RACA_VARIANT IDs from scenario_variants; preserve all bindings during repair. Multiple inputs satisfying the SAME variant trigger are allowed within its test.
 
   ====================
   TASK
@@ -346,11 +356,10 @@ test_case_fix_failed_prompt: |
     test-export wrapper, callable callback, or already-present instrumentation that reaches
     the production call path. Do not invent a new external harness API.
   - If scenario context includes `boundary_controls` for the failing boundary, use those exported hook controls to install and clear your fake implementation.
-  - For hook-controlled direct boundaries, keep using the framework-owned canonical fake
-    function and its state variables. Do not introduce a new fake declaration or pass a
-    new fake name such as `_success`, `_positive`, `_negative`, `_error`, or `_errval` to
-    a hook setter. Configure those behaviors through the canonical fake's return/output
-    state instead.
+  - For hook-controlled direct boundaries, use the matching `mock_interfaces` slot.
+    Its signature is fixed; repair its body and reset/configure its local state in the test.
+    Do not modify a fake or state declaration used by frozen tests. New coverage variants
+    have separately allocated interfaces so their bodies can model new output/return effects.
   - For runtime crashes, first repair the real environment object graph used by the target
     path. A fake return value must point to a correctly typed, initialized object whose
     nested fields remain valid for the whole test. Initialize locks and other kernel
@@ -444,6 +453,7 @@ test_case_extend_coverage_prompt: |
   ====================
   New tests must follow this scenario context:
   {scenario_context}
+  Each new variant must connect its needed mocks before the target call and initialize its own fake state; another test's installation or captured data is not evidence. Derive the expected result independently from the input, mock behavior and target logic. Assert the target's result or a captured interaction without overwriting it after the call. Keep the fixed hook lifecycle unchanged.
 
   ====================
   CONTEXT
@@ -466,11 +476,11 @@ test_case_extend_coverage_prompt: |
   ====================
   You must increase code coverage only by adding new KUnit test cases.
 
-  You are allowed to add new static void xxx_test(struct kunit *test) functions whose sole purpose is to exercise the specified uncovered lines and branches and whose RACA_SCENARIO marker references an active scenario in the scenario context. You are not allowed to modify, delete, reorder, or refactor any existing test functions.
+  You are allowed to add new static void xxx_test(struct kunit *test) functions for the specified uncovered lines and branches, implementing the corresponding variant's complete trigger, boundary behavior and checks from scenario_variants. Reaching a location without checking its required effects is insufficient. A new variant may contain multiple concrete inputs satisfying its trigger. You are not allowed to modify, delete, reorder, or refactor any existing test functions.
   If the scenario context contains `coverage_targets`, each new coverage test must implement one listed target. Use the target's `scenario_id` in `RACA_SCENARIO` and the target's `variant_id` in `RACA_VARIANT`. This means one scenario may intentionally have multiple test variants.
   When a missed line or branch maps to an existing scenario, add a new variant for that scenario instead of inventing a new scenario or changing an existing passing test.
 
-  All existing parts of the test file are considered frozen and must remain byte-for-byte identical to the input, including but not limited to all #include directives, required driver local definitions, extern declarations, existing mock definitions, helper utilities, fixed or reserved regions, and all previously defined test cases. Any change outside of newly added test functions and test registration will be considered an error.
+  All existing parts of the test file are considered frozen and must remain byte-for-byte identical to the input, including all #include directives, required driver local definitions, extern declarations, existing mock definitions, helper utilities, fixed regions, and existing test cases. Only additive new tests, their necessary local support code, and KUNIT_CASE entries are permitted. The framework, not you, appends allocated mock declarations to its fixed interface block.
 
   You may modify the test suite registration only to register the newly added test cases (for example, by appending additional KUNIT_CASE(...) entries). Existing registrations must not be altered or reordered.
 
@@ -486,16 +496,17 @@ test_case_extend_coverage_prompt: |
   target, so later helper calls cannot reach real hardware.
   If a new helper/fake/setup function controls a boundary, add:
     /* RACA_MOCK: boundary=<boundary_id>; original=<boundary_expression>; replacement=<replacement_function> */
-  If the helper is installed through a boundary hook setter, its function signature must
-  exactly match the original API type expected by that setter. Do not cast incompatible
-  fake functions.
+  Use the name and signature allocated in `mock_interfaces` for the selected scenario/variant.
+  Implement its body without changing an existing mock or inventing a new interface.
+  Do not cast incompatible fake functions. Configure and reset new state within the new test,
+  and clear installed hooks before returning so later tests do not inherit its behavior.
 
   Every newly added test function MUST include:
     /* RACA_SCENARIO: <scenario_id> */
     /* RACA_VARIANT: <variant_id> */
   Do not combine multiple scenario IDs in one RACA_SCENARIO marker. If two scenario contracts need tests,
   create two separate test functions and register both of them.
-  Use `RACA_VARIANT` only with a `variant_id` from `coverage_targets`; initial scenario tests that are not coverage variants do not need this marker.
+  Use `RACA_VARIANT` only with a planned `variant_id` from `scenario_variants` (or coverage_targets in legacy contexts). An omitted marker means `initial`; it does not authorize an unplanned variant.
 
   Newly added tests should implement the scenario checks, required effects, and runtime witnesses from the
   scenario contract. Use RACA_CHECK, RACA_EFFECT, and RACA_WITNESS comments immediately before their
@@ -576,10 +587,12 @@ test_case_patch_retry_prompt: |
   - Keep the original task intent; do not rewrite unrelated code.
   - During repair stages, keep existing test function names stable. Do not delete a failing
     test and add a replacement under a new name.
+  - Adding tests for missing active scenarios is allowed, including recovery from an
+    empty test set. Retain existing tests and all fixed/frozen regions.
   - Do not modify includes, extern declarations, driver-local definitions, frozen tests, or already passing scenario tests.
   - Do not invent external test harness/control APIs. Any helper/fake control function must be fully defined in the current test file.
   - Do not remove RACA_SCENARIO, RACA_CHECK, RACA_EFFECT, or RACA_WITNESS bindings.
-  - Do not bind multiple test functions to the same scenario.
+  - Keep one RACA_SCENARIO per test. Multiple tests for that scenario are allowed when they implement distinct planned RACA_VARIANT IDs; do not merge, rebind or remove existing variants. Multiple independently checked inputs within the same condition variant are allowed.
   - If the rejection was caused by validation, fix only the validation violation while preserving the intended repair.
   - If the rejection says no source-code changes were produced, the previous rewrite
     was identical to the current file or empty. You MUST make the smallest concrete source

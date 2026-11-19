@@ -26,12 +26,14 @@ def test_metrics_from_kunit(kunit_summary: Dict) -> Dict[str, object]:
     tests = [item for item in (kunit_summary or {}).get("tests", []) or [] if isinstance(item, dict)]
     passed = [item for item in tests if item.get("status") == "passed"]
     failed = [item for item in tests if item.get("status") == "failed"]
-    total = len(tests)
+    skipped = [item for item in tests if item.get("status") == "skipped"]
+    total = max(len(tests), int((kunit_summary or {}).get("tests_total") or 0))
     return {
         "tests_total": total,
         "tests_passed": len(passed),
         "tests_failed": len(failed),
-        "pass_rate": (len(passed) / total * 100.0) if total else 0.0,
+        "tests_skipped": len(skipped),
+        "pass_rate": (len(passed) / total * 100.0) if total and (kunit_summary or {}).get("log_complete", True) else 0.0,
         "per_test": [
             {
                 "name": item.get("name", ""),
@@ -234,40 +236,92 @@ def _remove_orphan_static_prototypes(test_code: str) -> str:
 
 
 def parse_kunit_results_text(text: str, suite_name: Optional[str] = None) -> Dict[str, object]:
+    if suite_name and re.search(r"#\s+Subtest:", text or ""):
+        text = suite_log_block(text, suite_name)
+    lines = [re.sub(r"^\s*\[[^\]]+\] ?", "", line).rstrip() for line in (text or "").splitlines()]
     results: List[Dict[str, str]] = []
-    suite_names = {suite_name} if suite_name else set()
-    for raw_line in (text or "").splitlines():
-        stripped = raw_line.strip()
+    groups = []
+    errors = []
+    if not any(re.match(r"\s*#\s+Subtest:", line) for line in lines):
+        indents = [len(line) - len(line.lstrip()) for line in lines if RESULT_PATTERN.match(line.strip())
+                   and RESULT_PATTERN.match(line.strip()).group(2) != suite_name]
+        groups.append({"name": suite_name, "indent": min(indents) if indents else 0,
+                       "plans": [], "summary": None, "cases": [], "header": False, "closed": None})
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        header = re.match(r"#\s+Subtest:\s+(\S+)", stripped)
+        if header:
+            groups.append({"name": header.group(1), "indent": indent, "plans": [], "summary": None,
+                           "cases": [], "header": True, "closed": None})
+            continue
+        group = next((item for item in reversed(groups) if item["indent"] == indent), None)
+        plan = re.fullmatch(r"1\.\.(\d+)(?:\s+#.*)?", stripped)
+        if plan and group is not None:
+            group["plans"].append(int(plan.group(1)))
         summary_match = SUITE_SUMMARY_PATTERN.match(stripped)
         if summary_match:
-            suite_names.add(summary_match.group(1))
+            summarized = next((item for item in reversed(groups) if item["name"] == summary_match.group(1)), None)
+            if summarized is not None:
+                summarized["summary"] = int(re.search(r"\btotal:(\d+)", stripped).group(1))
             continue
         match = RESULT_PATTERN.match(stripped)
         if not match:
             continue
         status_word, name = match.groups()
-        if name in suite_names or "-" in name:
+        if suite_name and name == suite_name and groups and not groups[0]["header"]:
+            groups[0]["closed"] = status_word == "ok"
             continue
-        status = "passed" if status_word == "ok" else "failed"
-        results.append(
-            {
-                "name": name,
-                "status": status,
-                "pass_rate": 100.0 if status == "passed" else 0.0,
-            }
-        )
+        child = next((item for item in reversed(groups) if item["name"] == name and item["indent"] > indent), None)
+        if child is not None:
+            child["closed"] = status_word == "ok"
+        if group is None:
+            continue
+        number = re.match(r"(?:ok|not ok)\s+(\d+)", stripped)
+        skipped = re.search(r"\s+#\s*SKIP\b", stripped, re.IGNORECASE)
+        status = "skipped" if skipped else ("passed" if status_word == "ok" else "failed")
+        group["cases"].append((int(number.group(1)), child is not None))
+        if child is None:
+            results.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "pass_rate": 100.0 if status == "passed" else 0.0,
+                }
+            )
     passed = [r["name"] for r in results if r["status"] == "passed"]
     failed = [r["name"] for r in results if r["status"] == "failed"]
-    total = len(results)
-    pass_rate = (len(passed) / total * 100.0) if total else 0.0
+    skipped = [r["name"] for r in results if r["status"] == "skipped"]
+    total = 0
+    if not groups:
+        errors.append("Missing target suite")
+    for group in groups:
+        if len(group["plans"]) > 1:
+            errors.append("Multiple test plans in " + str(group["name"]))
+        expected = group["plans"][0] if group["plans"] else group["summary"]
+        if expected is None:
+            errors.append("Missing test plan and summary in " + str(group["name"]))
+        elif sorted(number for number, _ in group["cases"]) != list(range(1, expected + 1)):
+            errors.append("Missing, duplicate or unexpected test results in " + str(group["name"]))
+        if group["header"] and group["closed"] is None:
+            errors.append("Missing completion result for " + str(group["name"]))
+        total += max(len(group["cases"]), expected or 0) - sum(aggregate for _, aggregate in group["cases"])
+    if re.search(r"\bBail out!", text or "", re.IGNORECASE):
+        errors.append("KTAP bailout")
+    complete = not errors
+    pass_rate = (len(passed) / total * 100.0) if total and complete else 0.0
     return {
         "tests": results,
         "passed": passed,
         "failed": failed,
+        "skipped": skipped,
         "tests_total": total,
         "tests_passed_count": len(passed),
         "tests_failed_count": len(failed),
-        "overall_passed": len(failed) == 0 and bool(results),
+        "tests_skipped_count": len(skipped),
+        "log_complete": complete,
+        "parse_errors": errors,
+        "overall_passed": complete and all(group["closed"] is not False for group in groups) and len(passed) == total and bool(results),
         "pass_rate": pass_rate,
         "per_test_pass_rate": [
             {

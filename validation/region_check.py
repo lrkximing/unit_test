@@ -2,7 +2,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
-from validation.test_inspector import inspect_test_source, test_function_map
+from validation.test_inspector import (C_PARSER, _node_text, _walk, _find_matching_brace as matching_brace,
+                                       inspect_test_source, test_function_map)
 
 
 DRIVER_LOCAL_BEGIN = "/* ===== Driver Local Definitions BEGIN ===== */"
@@ -68,6 +69,17 @@ def _find_matching_brace(code: str, open_idx: int) -> Optional[int]:
 
 
 def _function_blocks(code: str) -> Dict[str, str]:
+    if C_PARSER is not None:
+        data = code.encode()
+        result = {}
+        for node in _walk(C_PARSER.parse(data).root_node):
+            if node.type != "function_definition":
+                continue
+            from validation.test_inspector import _function_name_from_definition
+            name = _function_name_from_definition(node, data)
+            if name:
+                result[name] = _node_text(data, node)
+        return result
     blocks: Dict[str, str] = {}
     pattern = re.compile(
         r"(?m)^[A-Za-z_][A-Za-z0-9_\s\*]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{"
@@ -77,11 +89,41 @@ def _function_blocks(code: str) -> Dict[str, str]:
         open_idx = code.find("{", match.end() - 1)
         if open_idx < 0:
             continue
-        end_idx = _find_matching_brace(code, open_idx)
+        end_idx = matching_brace(code, open_idx)
         if end_idx is None:
             continue
         blocks[name] = code[match.start() : end_idx + 1]
     return blocks
+
+
+def _file_declarations(code):
+    """Map referenced globals/types/macros to their complete source declarations."""
+    if C_PARSER is None:
+        return {}
+    data = code.encode()
+    result = {}
+    for node in C_PARSER.parse(data).root_node.named_children:
+        if node.type in {"comment", "function_definition", "preproc_include"}:
+            continue
+        owners = []
+        for declarator in node.children_by_field_name("declarator"):
+            while declarator.child_by_field_name("declarator") is not None:
+                declarator = declarator.child_by_field_name("declarator")
+            if declarator.type in {"identifier", "type_identifier"}:
+                owners.append(declarator)
+        if node.type in {"struct_specifier", "union_specifier", "enum_specifier", "preproc_def", "preproc_function_def"}:
+            name = node.child_by_field_name("name")
+            if name is not None:
+                owners.append(name)
+        for owner in owners:
+            result.setdefault(_node_text(data, owner), []).append(_node_text(data, node))
+    return {name: sorted(set(values)) for name, values in result.items()}
+
+
+def _suite_contract(code):
+    suites = re.findall(r"(?:static\s+)?struct\s+kunit_suite\s+\w+\s*=\s*\{.*?\};", code, re.S)
+    registrations = re.findall(r"\bkunit_test_suites?\s*\([^;]*\);", code)
+    return suites, registrations
 
 
 def extract_test_function(code: str, test_name: str) -> Optional[str]:
@@ -109,6 +151,16 @@ def validate_protected_regions(
 
     if _suite_names(before) != _suite_names(after):
         errors.append("KUnit suite name changed; result collection path would become stale.")
+    if _suite_contract(before) != _suite_contract(after):
+        errors.append("Protected KUnit suite registration/setup changed.")
+    lifecycle = r"/\* ===== Framework Hook Lifecycle BEGIN ===== \*/.*?/\* ===== Framework Hook Lifecycle END ===== \*/"
+    if re.findall(lifecycle, before, re.S) != re.findall(lifecycle, after, re.S):
+        errors.append("Protected framework hook lifecycle changed.")
+    from generation.mock_interfaces import BEGIN, END
+    def mock_block(code):
+        return code[code.index(BEGIN):code.index(END) + len(END)] if BEGIN in code and END in code else ""
+    if mock_block(before) != mock_block(after):
+        errors.append("Protected mock declarations changed.")
 
     before_local = _driver_local_block(before)
     after_local = _driver_local_block(after)
@@ -120,6 +172,8 @@ def validate_protected_regions(
     before_info = inspect_test_source(before or "")
     after_blocks = _function_blocks(after or "")
     before_blocks = _function_blocks(before or "")
+    after_info = inspect_test_source(after or "")
+    before_decls, after_decls = _file_declarations(before), _file_declarations(after)
     for test_name in frozen:
         before_body = extract_test_function(before, test_name)
         after_body = extract_test_function(after, test_name)
@@ -138,14 +192,26 @@ def validate_protected_regions(
         )
         if frozen_test_info is None:
             continue
-        for helper_name in frozen_test_info.call_names:
-            if helper_name == test_name:
+        after_test = next((test for test in after_info.test_functions if test.name == test_name), None)
+        if after_test and (after_test.scenario_ids, after_test.variant_id) != (frozen_test_info.scenario_ids, frozen_test_info.variant_id):
+            errors.append(f"Frozen test binding changed: {test_name}")
+        pending, seen = [test_name], set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
                 continue
-            before_helper = before_blocks.get(helper_name)
-            if before_helper is None:
-                continue
-            after_helper = after_blocks.get(helper_name)
-            if after_helper != before_helper:
-                errors.append(f"Helper used by frozen test changed: {helper_name} used by {test_name}")
+            seen.add(name)
+            if name in before_blocks:
+                if before_blocks[name] != after_blocks.get(name):
+                    errors.append(f"Helper used by frozen test changed: {name} used by {test_name}")
+                pending.extend(before_info.function_identifier_names.get(name, []))
+            elif name in before_decls:
+                # Case-array growth is framework registration, not a mock-state change.
+                declarations = [d for d in before_decls[name] if 'struct kunit_case' not in d and 'struct kunit_suite' not in d]
+                corresponding = [d for d in after_decls.get(name, []) if 'struct kunit_case' not in d and 'struct kunit_suite' not in d]
+                if declarations != corresponding:
+                    errors.append(f"State/type/macro used by frozen test changed: {name} used by {test_name}")
+                for declaration in declarations:
+                    pending.extend(re.findall(r"\b[A-Za-z_]\w*\b", declaration))
 
     return RegionValidationResult(ok=not errors, errors=errors, warnings=warnings)

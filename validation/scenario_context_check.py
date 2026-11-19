@@ -41,6 +41,8 @@ def validate_scenario_context_structure(scenario_context: Dict) -> ScenarioConte
         errors.append("Scenario registry missing export_function.")
     if not registry.get("source_facts"):
         warnings.append("Scenario registry contains no source facts.")
+    from scenario.condition_variants import variant_plan_errors
+    errors.extend(variant_plan_errors(scenario_context))
     if not isinstance(registry.get("boundary_candidates", []), list):
         errors.append("Scenario registry boundary_candidates must be a list.")
     if not isinstance(registry.get("scenario_candidates", []), list):
@@ -48,6 +50,9 @@ def validate_scenario_context_structure(scenario_context: Dict) -> ScenarioConte
     contracts = registry.get("scenario_contracts", [])
     if not isinstance(contracts, list) or not contracts:
         errors.append("Scenario registry must include at least one scenario contract.")
+    if 'mock_interfaces' in scenario_context:
+        from generation.mock_interfaces import allocation_errors
+        errors.extend(allocation_errors(scenario_context))
     for idx, contract in enumerate(contracts if isinstance(contracts, list) else []):
         scenario_id = contract.get("scenario_id")
         if not scenario_id:

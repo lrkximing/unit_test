@@ -96,6 +96,8 @@ class ResultCheck:
     target: str
     expected_relation: str
     evidence_ids: List[str] = field(default_factory=list)
+    boundary_id: str = ""
+    argument_index: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

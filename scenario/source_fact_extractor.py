@@ -37,6 +37,25 @@ def _contains_node_type(node, node_type: str) -> bool:
     return any(item.type == node_type for item in _walk(node))
 
 
+def _control_context(node, code: bytes, base_line: int) -> List[Dict]:
+    """Lexical control dependence, not symbolic feasibility or dominance."""
+    result = []
+    child = node
+    parent = node.parent
+    while parent is not None and parent.type != "function_definition":
+        if parent.type == "if_statement":
+            consequence = parent.child_by_field_name("consequence")
+            alternative = parent.child_by_field_name("alternative")
+            outcome = True if child == consequence else False if child == alternative else None
+            if outcome is not None:
+                result.append({"kind": "if", "line": base_line + parent.start_point[0] + 1,
+                               "condition": _condition_expression(parent, code), "outcome": outcome})
+        elif parent.type in {"for_statement", "while_statement", "do_statement", "switch_statement"}:
+            result.append({"kind": parent.type, "line": base_line + parent.start_point[0] + 1})
+        child, parent = parent, parent.parent
+    return list(reversed(result))
+
+
 def _stable_id(prefix: str, function: str, line: int, node_type: str, text: str) -> str:
     digest = hashlib.sha1(f"{function}:{line}:{node_type}:{text}".encode("utf-8")).hexdigest()[:10]
     return f"{prefix}_{digest}"
@@ -96,9 +115,11 @@ def _fact_definition_symbols(fact: SourceFact) -> Set[str]:
 
 def _fact_use_symbols(fact: SourceFact) -> Set[str]:
     metadata = fact.metadata or {}
+    if fact.kind == 'FUNCTION':
+        return set()
     if fact.kind in {"ASSIGNMENT", "FIELD_WRITE"}:
         return set(metadata.get("right_symbols", []) or [])
-    if fact.kind == "GUARD":
+    if fact.kind in {"GUARD", "SWITCH"}:
         return set(metadata.get("condition_symbols", []) or fact.symbols)
     if fact.kind in {"CALL", "MEMBER_CALL"}:
         return set(fact.symbols) - _fact_definition_symbols(fact)
@@ -147,6 +168,16 @@ def _link_related_facts(facts: List[SourceFact]) -> List[SourceFact]:
 
     for function_facts in by_function.values():
         ordered = sorted(function_facts, key=lambda item: (item.start_line, item.end_line, item.fact_id))
+
+        for call in (item for item in ordered if item.kind in {"CALL", "MEMBER_CALL"}):
+            consumer = call.metadata.get("result_consumer", {})
+            if not consumer:
+                continue
+            target = next((item for item in ordered if item.kind == consumer["kind"]
+                           and item.metadata.get("source_order") == consumer["source_order"]), None)
+            if target is not None:
+                _add_relation(call, target, "call_result_influences_" + target.kind.lower())
+                _add_relation(target, call, "uses_call_result")
 
         for guard in [item for item in ordered if item.kind == "GUARD"]:
             first_return_line = int((guard.metadata or {}).get("first_return_line") or 0)
@@ -663,6 +694,9 @@ def _nearest_statement(node):
 def _assignment_left_for_call(call_node, code: bytes) -> str:
     current = call_node.parent
     while current is not None:
+        # An argument's result is not the enclosing call's returned value.
+        if current.type in {"call_expression", "argument_list"}:
+            return ""
         if current.type == "assignment_expression":
             left = current.child_by_field_name("left")
             right = current.child_by_field_name("right")
@@ -684,6 +718,24 @@ def _assignment_left_for_call(call_node, code: bytes) -> str:
             return ""
         current = current.parent
     return ""
+
+
+def _direct_result_consumer(call_node):
+    current = call_node.parent
+    while current is not None:
+        if current.type == "call_expression":
+            return {}
+        if current.type in {"if_statement", "switch_statement"}:
+            condition = current.child_by_field_name("condition")
+            if condition is not None and condition.start_byte <= call_node.start_byte and call_node.end_byte <= condition.end_byte:
+                return {"kind": "GUARD" if current.type == "if_statement" else "SWITCH", "source_order": current.start_byte}
+            return {}
+        if current.type == "return_statement":
+            return {"kind": "RETURN", "source_order": current.start_byte}
+        if current.type in {"expression_statement", "declaration", "compound_statement", "function_definition"}:
+            return {}
+        current = current.parent
+    return {}
 
 
 def _return_expression(return_node, code: bytes) -> str:
@@ -899,6 +951,7 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
                 "argument_type_map": _argument_type_map(argument_path_map, function_parameter_types),
                 "output_arguments": _output_argument_paths(args_node, code),
                 "result_assignee": _assignment_left_for_call(node, code),
+                "result_consumer": _direct_result_consumer(node),
                 "statement": _node_text(code, _nearest_statement(node)).strip(),
                 "statement_kind": getattr(_nearest_statement(node), "type", ""),
                 "function_parameters": function_parameters,
@@ -908,6 +961,10 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
             fact = _fact("F_CALL", kind, file_path, function.name, base_line, code, node, metadata)
         elif node.type == "if_statement":
             condition_node = node.child_by_field_name("condition")
+            consequence = node.child_by_field_name("consequence")
+            direct_return = consequence is not None and (
+                consequence.type == "return_statement" or
+                consequence.type == "compound_statement" and any(child.type == "return_statement" for child in consequence.named_children))
             return_expr, return_line, return_text = _first_return_in_consequence(node, code)
             branch_requirements, fallthrough_requirements = _condition_path_requirements(condition_node, code)
             loop_context = _enclosing_loop_context(node, code, base_line)
@@ -923,8 +980,11 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
                 "first_return_expression": return_expr,
                 "first_return_line": base_line + return_line if return_line else 0,
                 "first_return_code": return_text,
+                "consequence_has_direct_return": direct_return,
             }
             fact = _fact("F_GUARD", "GUARD", file_path, function.name, base_line, code, node, metadata)
+            fact.metadata["control_context"] = _control_context(node, code, base_line)
+            fact.metadata["source_order"] = node.start_byte
             key = (fact.kind, fact.start_line, fact.code)
             if key not in seen:
                 seen.add(key)
@@ -952,6 +1012,15 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
                 )
             )
             continue
+        elif node.type == "switch_statement":
+            condition = node.child_by_field_name("condition")
+            metadata = {
+                "condition": _node_text(code, condition).strip() if condition is not None else "",
+                "condition_symbols": _identifier_symbols(condition, code) if condition is not None else [],
+                "function_parameters": function_parameters,
+                "coverage_role": "lexical control anchor; compiler edge indices do not identify case outcomes",
+            }
+            fact = _fact("F_SWITCH", "SWITCH", file_path, function.name, base_line, code, node, metadata)
         elif node.type in {"for_statement", "while_statement", "do_statement"}:
             metadata = _loop_context(node, code, base_line)
             metadata["loop_cases"] = _loop_cases(node, code)
@@ -1002,6 +1071,8 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
         else:
             continue
 
+        fact.metadata["control_context"] = _control_context(node, code, base_line)
+        fact.metadata["source_order"] = node.start_byte
         key = (fact.kind, fact.start_line, fact.code)
         if key not in seen:
             seen.add(key)
@@ -1026,7 +1097,17 @@ def _extract_facts_from_function(parse_result, function) -> List[SourceFact]:
             )
         )
 
+    facts.append(_function_source_fact(file_path, function, function_parameters))
     return facts
+
+
+def _function_source_fact(file_path, function, parameters):
+    return SourceFact(
+        fact_id=_stable_id('F_FUNCTION', function.name, function.start_line, 'function_definition', function.code),
+        kind='FUNCTION', file=file_path, function=function.name, start_line=function.start_line,
+        end_line=function.end_line, code=function.code, symbols=[],
+        metadata={'function_parameters': parameters,
+                  'coverage_role': 'source ownership fallback for compiler edges without a precise lexical site; edge outcome is unknown'})
 
 
 def _extract_facts_from_function_fallback(parse_result, function) -> List[SourceFact]:
@@ -1364,6 +1445,18 @@ def _extract_facts_from_function_fallback(parse_result, function) -> List[Source
         )
 
     class FactVisitor(c_ast.NodeVisitor):
+        def visit_Switch(self, node):
+            fact = add("SWITCH", "F_SWITCH", node, text_for(node), {
+                "condition": text_for(node.cond), "condition_symbols": symbols_for(node.cond),
+                "function_parameters": function_parameters,
+                "coverage_role": "lexical control anchor; compiler edge indices do not identify case outcomes",
+            })
+            def last_line(item):
+                return max([line_for(item)] + [last_line(child) for _, child in item.children()])
+            if fact is not None:
+                fact.end_line = last_line(node)
+            self.generic_visit(node)
+
         def visit_If(self, node):
             return_expr = ""
             return_line = 0
@@ -1473,6 +1566,7 @@ def _extract_facts_from_function_fallback(parse_result, function) -> List[Source
 
     FactVisitor().visit(tree)
 
+    facts.append(_function_source_fact(file_path, function, function_parameters))
     return facts
 
 

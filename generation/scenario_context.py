@@ -1,5 +1,6 @@
 import json
 from typing import Dict, Iterable, List, Optional, Set
+from scenario.condition_variants import behavior_fingerprint, initialize_variants, planned_variants
 
 from scenario.boundary_classifier import classify_boundary_candidates_with_optional_llm
 from scenario.harness_feasibility import allowed_generated_scenario_ids, direct_uncontrollable_scenario_ids
@@ -16,7 +17,9 @@ def build_scenario_context(parse_result, function, export_interfaces) -> Dict:
     active = select_initial_active_scenario_ids(context.get("scenario_registry", {}))
     context["active_scenario_ids"] = active
     context["scenario_registry"]["active_scenario_ids"] = active
-    return context
+    from analysis.source_dependencies import collect_source_dependencies
+    context["source_dependencies"] = collect_source_dependencies(parse_result, function)
+    return initialize_variants(context)
 
 
 def generate_scenario_context(
@@ -27,8 +30,22 @@ def generate_scenario_context(
     model,
     tokenizer,
     export_interfaces,
+    registry=None,
 ) -> Dict:
-    registry = build_scenario_registry(parse_result, function, export_interfaces)
+    if registry is None:
+        registry = prepare_scenario_registry(parse_result, function, local_or_api, prompt_path, model, tokenizer)
+    context = registry_to_generation_context(registry, export_interfaces)
+    active = select_initial_active_scenario_ids(context.get("scenario_registry", {}))
+    context["active_scenario_ids"] = active
+    context["scenario_registry"]["active_scenario_ids"] = active
+    from analysis.source_dependencies import collect_source_dependencies
+    context["source_dependencies"] = collect_source_dependencies(parse_result, function)
+    return initialize_variants(context)
+
+
+def prepare_scenario_registry(parse_result, function, local_or_api, prompt_path, model, tokenizer):
+    """Classify once, before both hook construction and scenario realization."""
+    registry = build_scenario_registry(parse_result, function)
     classify_boundary_candidates_with_optional_llm(
         registry=registry,
         parse_result=parse_result,
@@ -39,11 +56,7 @@ def generate_scenario_context(
         tokenizer=tokenizer,
     )
     rebuild_scenarios_for_registry(registry)
-    context = registry_to_generation_context(registry, export_interfaces)
-    active = select_initial_active_scenario_ids(context.get("scenario_registry", {}))
-    context["active_scenario_ids"] = active
-    context["scenario_registry"]["active_scenario_ids"] = active
-    return context
+    return registry
 
 
 def _contract_fact_ids(contract: Dict) -> Set[str]:
@@ -94,44 +107,6 @@ def _contract_selection_fact_ids(contract: Dict) -> Set[str]:
     return _contract_fact_ids(contract)
 
 
-def _contract_coverage_atoms(contract: Dict, facts_by_id: Dict[str, Dict], target_function: str) -> Set[tuple]:
-    atoms: Set[tuple] = set()
-    derivation = contract.get("derivation", "")
-    if derivation in {"source_fact_graph:condition_case", "source_fact_graph:loop_boundary"}:
-        atoms.add(("scenario", contract.get("scenario_id", "")))
-
-    for fact_id in _contract_selection_fact_ids(contract):
-        fact = facts_by_id.get(fact_id)
-        if not fact:
-            continue
-        if target_function and fact.get("function") != target_function:
-            continue
-        line = fact.get("start_line")
-        if not line:
-            continue
-        if fact.get("kind") == "BRANCH_EDGE":
-            edge = (fact.get("metadata", {}) or {}).get("edge", "")
-            atoms.add(("branch", line, edge))
-        else:
-            atoms.add(("line", line))
-
-    if atoms:
-        return atoms
-
-    for check in contract.get("scenario_checks", []) or []:
-        if not isinstance(check, dict):
-            continue
-        atoms.add(
-            (
-                "check",
-                check.get("kind", ""),
-                check.get("target", ""),
-                check.get("expected_relation", ""),
-            )
-        )
-    return atoms
-
-
 def _contract_first_line(contract: Dict, facts_by_id: Dict[str, Dict], target_function: str) -> int:
     lines = []
     for fact_id in _contract_selection_fact_ids(contract):
@@ -147,13 +122,7 @@ def _contract_first_line(contract: Dict, facts_by_id: Dict[str, Dict], target_fu
 
 
 def select_initial_active_scenario_ids(registry: Dict) -> List[str]:
-    """Pick a source-coverage frontier without discarding the full registry.
-
-    The full scenario registry is still saved.  Initial generation activates
-    contracts that add new target-function source-fact coverage.  Hardware
-    feasibility is not used as a hard filter here; later verification decides
-    whether a generated test actually reaches and controls the boundary.
-    """
+    """Keep distinct behavior contracts even when they share source coverage."""
     contracts = registry.get("scenario_contracts", []) or []
     facts_by_id = {
         item.get("fact_id", ""): item
@@ -162,39 +131,16 @@ def select_initial_active_scenario_ids(registry: Dict) -> List[str]:
     }
     target_function = registry.get("target_function", "")
 
-    candidates: List[Dict] = []
-
-    for contract in contracts:
+    selected, fingerprints = [], set()
+    for contract in sorted(contracts, key=lambda c: (
+            _contract_first_line(c, facts_by_id, target_function), c.get("scenario_id", ""))):
         scenario_id = contract.get("scenario_id", "")
         if not scenario_id:
             continue
-        atoms = _contract_coverage_atoms(contract, facts_by_id, target_function)
-        if not atoms:
-            continue
-        candidates.append(
-            {
-                "scenario_id": scenario_id,
-                "atoms": atoms,
-                "first_line": _contract_first_line(contract, facts_by_id, target_function),
-            }
-        )
-
-    selected: List[str] = []
-    covered: Set[tuple] = set()
-    remaining = list(candidates)
-    while remaining:
-        ranked = sorted(
-            remaining,
-            key=lambda item: (-len(item["atoms"] - covered), item["first_line"], item["scenario_id"]),
-        )
-        best = ranked[0]
-        new_atoms = best["atoms"] - covered
-        if not new_atoms:
-            break
-        selected.append(best["scenario_id"])
-        covered.update(best["atoms"])
-        remaining = [item for item in remaining if item["scenario_id"] != best["scenario_id"]]
-
+        fingerprint = behavior_fingerprint(contract)
+        if fingerprint not in fingerprints:
+            selected.append(scenario_id)
+            fingerprints.add(fingerprint)
     return selected
 
 
@@ -205,20 +151,18 @@ def _short_text(value, limit: int = MAX_TEXT_FIELD):
     if not isinstance(value, str):
         return value
     value = value.strip()
-    if len(value) <= limit:
-        return value
-    return value[:limit] + "...<truncated>"
+    return value
 
 
 def _compact_list(value: Iterable, limit: int = 8) -> List:
     if not isinstance(value, list):
         return []
     compacted = []
-    for item in value[:limit]:
+    for item in value:
         if isinstance(item, str):
             compacted.append(_short_text(item))
         elif isinstance(item, list):
-            compacted.append(item[:limit])
+            compacted.append(_compact_list(item))
         elif isinstance(item, dict):
             compacted.append(_compact_small_dict(item))
         else:
@@ -269,6 +213,8 @@ def _compact_metadata(metadata: Dict) -> Dict:
         "argument_aliases",
         "initializer",
         "update",
+        "control_context",
+        "source_order",
     ):
         if key not in metadata:
             continue
@@ -425,6 +371,7 @@ def _compact_effects(effects: Iterable[Dict]) -> List[Dict]:
                 "description": _short_text(item.get("description", "")),
                 "relation": _short_text(item.get("relation", "")),
                 "evidence": item.get("evidence_ids", []),
+                "boundary_id": item.get("boundary_id", ""),
             }
         )
     return compacted
@@ -455,6 +402,8 @@ def _compact_checks(checks: Iterable[Dict]) -> List[Dict]:
                 "target": item.get("target", ""),
                 "expected": _short_text(item.get("expected_relation", "")),
                 "evidence": item.get("evidence_ids", []),
+                "boundary_id": item.get("boundary_id", ""),
+                "argument_index": item.get("argument_index"),
             }
         )
     return compacted
@@ -562,7 +511,7 @@ def _semantic_observation_guidance(contract: Dict) -> List[Dict]:
             continue
         seen.add(key)
         unique.append(item)
-    return unique[:8]
+    return unique
 
 
 def _compact_coverage_targets(targets: Iterable[Dict]) -> List[Dict]:
@@ -614,6 +563,7 @@ def _compact_contract(contract: Dict) -> Dict:
         compact["environment_constraints"].append(
             {
                 "constraint_id": constraint.get("constraint_id", ""),
+                "conditional": constraint.get("conditional", False),
                 "boundary_id": constraint.get("boundary_id", ""),
                 "boundary_expression": _short_text(constraint.get("boundary_expression", "")),
                 "location": {
@@ -695,16 +645,27 @@ def compact_scenario_context_for_prompt(scenario_context: Dict) -> Dict:
     facts_by_id = _fact_lookup(selected_facts)
 
     return {
-        "format": "raca_scenario_generation_view_v1",
+        "format": "raca_scenario_generation_view_v2",
         "target": {
             "function": registry.get("target_function") or (scenario_context.get("target", {}) or {}).get("function", ""),
             "wrapper": registry.get("export_function") or (scenario_context.get("target", {}) or {}).get("wrapper", ""),
         },
         "internal_call_closure": registry.get("internal_call_closure", []),
+        "source_dependencies": {k: v for k, v in scenario_context.get("source_dependencies", {}).items()
+                                if k != "observation"},
         "boundaries": [_compact_boundary(boundary) for boundary in selected_boundaries],
         "boundary_controls": _boundary_controls_from_context(scenario_context),
+        "mock_interfaces": scenario_context.get("mock_interfaces", []),
+        "variant_bindings": scenario_context.get("variant_bindings", []),
+        "scenario_variants": [
+            {**_attach_contract_evidence(v, _fact_lookup(registry_source_facts)), "variant_id": v["variant_id"],
+             **({"coverage_evidence": v["coverage_evidence"]} if "coverage_evidence" in v else {})}
+            for v in planned_variants(scenario_context) if v["scenario_id"] in allowed_ids
+        ],
         "scenarios": [
-            _attach_contract_evidence(contract, facts_by_id)
+            {"scenario_id": contract["scenario_id"], "source_anchors": contract.get("source_anchors", []),
+             "variant_ids": [v["variant_id"] for v in planned_variants(scenario_context)
+                             if v["scenario_id"] == contract["scenario_id"]]}
             for contract in prompt_contracts
         ],
         "coverage_targets": _compact_coverage_targets(scenario_context.get("coverage_targets", [])),
@@ -712,6 +673,9 @@ def compact_scenario_context_for_prompt(scenario_context: Dict) -> Dict:
         "all_active_scenario_ids": registry.get("active_scenario_ids", []),
         "direct_external_boundary_scenario_ids": direct_external_ids,
         "oracle_policy": {
+            "contract_location": "scenarios is an identity/anchor index. scenario_variants contains the authoritative complete trigger/environment/check contract and source evidence for each planned test; these bodies are not repeated in the index.",
+            "condition_variant_rule": "A variant binds its own trigger, environment and checks. Multiple concrete inputs may exercise the SAME local condition variant; each input must have an independently derived expected observation. A different trigger outcome requires a separately planned variant.",
+            "input_choice_rule": "Use the original expression and helper/macro definitions to choose discriminating inputs within the variant trigger, including applicable value boundaries, rounding transitions and state distinctions. Do not use mutation outcomes or treat structural coverage as input completeness.",
             "semantic_assertion_required": "Each generated test must assert at least one target-visible semantic observation for its scenario.",
             "witness_only_is_insufficient": "Runtime witnesses, effect markers, boundary call counts, allocation checks, and non-NULL checks prove reachability/setup only; they cannot be the sole assertion.",
             "llm_expected_value_rule": "The generator may derive exact expected values from scenario input, mock configuration, source evidence, constants/macros, output arguments, or visible state updates. If no exact value is grounded, use a narrower relation over a semantic observation rather than a broad EXPECT_NE/range check.",

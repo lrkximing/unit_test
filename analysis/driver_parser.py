@@ -69,6 +69,7 @@ class FileParseResult:
     # derived graphs
     call_graph: Dict[str, List[str]]              # f -> callees
     groups: List[List[str]]                       # connected components (undirected)
+    source_code: str = ""
 
 
 # ----------------------------
@@ -106,14 +107,22 @@ class CDriverParser:
         (Later you may also want to collect macro uses per function via identifier rules.)
         """
         macros: Dict[str, MacroInfo] = {}
-        pattern = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)\s*(.*)$', re.MULTILINE)
-
-        for m in pattern.finditer(code_str):
-            name = m.group(1)
-            full_line = m.group(0).strip()
-            line_no = code_str[:m.start()].count("\n") + 1
-            macros[name] = MacroInfo(name=name, code=full_line, line=line_no)
+        raw = code_str.encode("utf-8")
+        for node in self._file_scope_nodes(self.parser.parse(raw).root_node):
+            if node.type not in {"preproc_def", "preproc_function_def"}:
+                continue
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                name = self._slice(raw, name_node.start_byte, name_node.end_byte)
+                macros[name] = MacroInfo(name=name, code=self._slice(raw, node.start_byte, node.end_byte).strip(), line=node.start_point[0] + 1)
         return macros
+
+    def _file_scope_nodes(self, root):
+        for child in root.named_children:
+            if child.type in {"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif"}:
+                yield from self._file_scope_nodes(child)
+            else:
+                yield child
 
     # ---------- struct defs (in-file only) ----------
     def _collect_struct_defs(self, tree, code_bytes: bytes) -> Dict[str, StructInfo]:
@@ -212,18 +221,18 @@ class CDriverParser:
             "structs": set(structs_in_file.keys()),
         }
 
-        for child in root.children:
+        for child in self._file_scope_nodes(root):
             if child.type == "function_definition":
                 fn = self._get_function_name(child, code_bytes)
                 if fn:
                     defs["functions"].add(fn)
 
             elif child.type == "type_definition":
-                # typedef ... name;
-                # find last identifier in subtree as typedef name (best-effort)
-                ids = self._get_declaration_identifiers(child, code_bytes)
-                if ids:
-                    defs["types"].add(ids[-1])
+                for declarator in child.children_by_field_name("declarator"):
+                    while declarator.child_by_field_name("declarator") is not None:
+                        declarator = declarator.child_by_field_name("declarator")
+                    if declarator.type in {"identifier", "type_identifier"}:
+                        defs["types"].add(self._slice(code_bytes, declarator.start_byte, declarator.end_byte))
 
             elif child.type == "declaration":
                 # top-level declaration might be global var or function prototype
@@ -404,7 +413,7 @@ class CDriverParser:
         funcs: List[FunctionInfo] = []
         file_macro_names = file_defs.get("macros", set())
 
-        for child in root.children:
+        for child in self._file_scope_nodes(root):
             if child.type != "function_definition":
                 continue
 
@@ -547,6 +556,7 @@ class CDriverParser:
             functions=functions,
             call_graph=call_graph,
             groups=groups,
+            source_code=code_str,
         )
 
 

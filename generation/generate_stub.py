@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from analysis.driver_parser import FileParseResult, FunctionInfo, MacroInfo
 
 from tree_sitter_languages import get_parser
+from analysis.header_context import included_function_macros
 
 
 # -----------------------------
@@ -188,6 +189,7 @@ class StubSpec:
     mode: str = "incremental"       # "incremental" or "single"
     parse_result: Optional["FileParseResult"] = None  # optional parser output for context stubs
     enable_boundary_hooks: bool = True  # direct hardware hook controls are part of the full method
+    scenario_registry: Optional[object] = None  # classified facts shared with scenario generation
 
 
 @dataclass
@@ -553,9 +555,7 @@ def _build_related_context_block(
 
     sections: List[str] = []
     interfaces: List[ExportInterface] = []
-    for block, interface in _build_called_function_wrapper_blocks(target_info, spec, tree, code_bytes):
-        sections.append(block)
-        interfaces.append(interface)
+    # Callees execute through the real target. They are context, not extra test entrypoints.
 
     if not sections:
         return "", []
@@ -618,26 +618,27 @@ def _fact_for_boundary(boundary, facts_by_id: Dict[str, object]):
     return None
 
 
-def _direct_call_boundary_is_safely_hookable(boundary, fact, parse_result) -> bool:
+def _direct_call_boundary_is_safely_hookable(boundary, fact, parse_result, header_macros=None,
+                                            required_by_contract=False) -> bool:
     """Return whether the current C hook mechanism can safely control a call.
 
     Boundary discovery is intentionally broader than hook generation.  A source
     call may still be a useful scenario fact, but the generated hook block relies
     on `typeof(callee)` and therefore must only be emitted for direct external
-    function symbols that are not file-local macros and whose result/output is
-    actually needed to drive a test path.
+    function symbols that are not macros. A hardware write remains observable
+    through its arguments even when its return value is discarded.
     """
     if getattr(boundary, "source_fact_kind", "") != "CALL":
         return False
     expression = str(getattr(boundary, "expression", "") or "").strip()
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", expression):
         return False
-    if expression in _file_local_macro_names(parse_result):
+    if expression in _file_local_macro_names(parse_result) or expression in (header_macros or set()):
         return False
-    if getattr(boundary, "semantic_role", "unknown") != "hardware_boundary":
+    if expression in {function.name for function in getattr(parse_result, "functions", [])}:
         return False
-    metadata = getattr(fact, "metadata", {}) or {}
-    if not _call_result_controls_observable_behavior(metadata):
+    role = getattr(boundary, "semantic_role", "unknown")
+    if role != "hardware_boundary" and not (role == "unknown" and required_by_contract):
         return False
     return True
 
@@ -651,21 +652,32 @@ def _direct_boundary_candidates_for_stub(spec: StubSpec, target_info) -> List[ob
     except Exception:
         return []
     try:
-        facts, closure = extract_source_facts(spec.parse_result, target_info)
-        boundaries = analyze_boundary_candidates(spec.parse_result, facts)
+        if spec.scenario_registry is not None:
+            facts = spec.scenario_registry.source_facts
+            closure = spec.scenario_registry.internal_call_closure
+            boundaries = spec.scenario_registry.boundary_candidates
+        else:
+            facts, closure = extract_source_facts(spec.parse_result, target_info)
+            boundaries = analyze_boundary_candidates(spec.parse_result, facts)
     except Exception:
         return []
     facts_by_id = {getattr(fact, "fact_id", ""): fact for fact in facts}
+    required = set()
+    if spec.scenario_registry is not None:
+        for contract in spec.scenario_registry.scenario_contracts:
+            required.update(contract.dependent_boundaries)
     closure_set = set(closure or [])
     selected = []
     seen = set()
+    header_macros = included_function_macros(spec.driver_c_path)
     for boundary in boundaries:
         fact = _fact_for_boundary(boundary, facts_by_id)
         if fact is None:
             continue
         if closure_set and getattr(boundary, "source_function", "") not in closure_set:
             continue
-        if not _direct_call_boundary_is_safely_hookable(boundary, fact, spec.parse_result):
+        if not _direct_call_boundary_is_safely_hookable(boundary, fact, spec.parse_result, header_macros,
+                                                        boundary.candidate_id in required):
             continue
         if boundary.candidate_id in seen:
             continue
@@ -1042,6 +1054,12 @@ def apply_stub(spec: StubSpec) -> StubGenerationResult:
         boundary_candidates if replacements else [],
         spec.export_gpl,
     )
+    if spec.parse_result is not None:
+        from generation.state_interfaces import state_export_block
+        state_text, state_interfaces = state_export_block(spec.parse_result, spec.target_func_name, spec.export_gpl)
+        if state_text:
+            context_text = state_text + ('\n' + context_text if context_text else '')
+            context_interfaces = state_interfaces + context_interfaces
     if boundary_hook_text:
         if context_text and not context_text.endswith("\n"):
             context_text += "\n"

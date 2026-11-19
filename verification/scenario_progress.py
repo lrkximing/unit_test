@@ -7,20 +7,24 @@ def scenario_status_complete(scenario_runtime_status: Dict) -> bool:
     scenarios = scenario_runtime_status.get("scenarios", []) or []
     if not scenarios:
         return True
-    return all(item.get("status") in {"PASSED", "UNREALIZABLE_IN_CURRENT_HARNESS"} for item in scenarios)
+    return all(item.get("status") == "PASSED" for item in scenarios)
 
 
 def scenario_repair_targets(scenario_runtime_status: Dict) -> List[Dict]:
     return [
         item
         for item in scenario_runtime_status.get("scenarios", []) or []
-        if item.get("status") not in {"PASSED", "UNREALIZABLE_IN_CURRENT_HARNESS"}
+        if item.get("status") != "PASSED"
     ]
 
 
 def stable_tests_from_scenario_status(scenario_runtime_status: Dict) -> Set[str]:
     stable: Set[str] = set()
     for item in scenario_runtime_status.get("scenarios", []) or []:
+        variants = item.get("test_variants", []) or []
+        if variants:
+            stable.update(v["test_function"] for v in variants if v.get("status") == "PASSED")
+            continue
         if item.get("status") != "PASSED":
             continue
         stable.update(item.get("test_functions", []) or [])
@@ -80,16 +84,21 @@ def scenario_test_bindings(
         for scenario_id in test_function.scenario_ids:
             contract = contracts.get(scenario_id, {})
             status = scenario_status.get(scenario_id, {})
+            variant = next((item for item in status.get("test_variants", [])
+                            if item.get("test_function") == test_function.name), {})
             bindings.append(
                 {
                     "test_function": test_function.name,
-                    "variant_id": test_function.variant_id,
+                    "variant_id": test_function.variant_id or "initial",
+                    "variant_status": variant.get("status", "UNKNOWN"),
+                    "variant_reason": variant.get("reason", ""),
                     "kunit_status": test_status.get(test_function.name, "unknown"),
                     "scenario_id": scenario_id,
                     "scenario_status": status.get("status", "UNKNOWN"),
                     "scenario_reason": status.get("reason", ""),
-                    "runtime_witness_hits": status.get("runtime_witness_hits", []),
-                    "runtime_effect_hits": status.get("runtime_effect_hits", []),
+                    "runtime_witness_hits": variant.get("runtime_witness_hits", []),
+                    "runtime_effect_hits": variant.get("runtime_effect_hits", []),
+                    "runtime_assertion_hits": variant.get("runtime_assertion_hits", []),
                     "source_anchors": contract.get("source_anchors", []),
                     "dependent_boundaries": contract.get("dependent_boundaries", []),
                     "derivation": contract.get("derivation", ""),

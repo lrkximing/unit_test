@@ -33,6 +33,7 @@ class TestSourceInfo:
     function_definitions: List[str] = field(default_factory=list)
     function_call_names: Dict[str, List[str]] = field(default_factory=dict)
     function_identifier_names: Dict[str, List[str]] = field(default_factory=dict)
+    global_identifier_names: Dict[str, List[str]] = field(default_factory=dict)
     macro_definitions: List[str] = field(default_factory=list)
     registered_tests: List[str] = field(default_factory=list)
 
@@ -223,6 +224,21 @@ def _inspect_with_tree_sitter(code_text: str) -> TestSourceInfo:
         macro_definitions=_extract_macro_definitions_fallback(code_text),
     )
     for node in _walk(tree.root_node):
+        if node.type == "declaration":
+            parent = node.parent
+            file_scope = True
+            while parent is not None:
+                if parent.type in {"function_definition", "struct_specifier", "union_specifier"}:
+                    file_scope = False
+                    break
+                parent = parent.parent
+            if file_scope:
+                for declarator in node.children_by_field_name("declarator"):
+                    original_declarator = declarator
+                    while declarator.child_by_field_name("declarator") is not None:
+                        declarator = declarator.child_by_field_name("declarator")
+                    if declarator.type == "identifier":
+                        info.global_identifier_names[_node_text(code, declarator)] = _identifier_names_from_node(original_declarator, code)
         if node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
             if fn_node is not None and _callee_name(fn_node, code) == "KUNIT_CASE":

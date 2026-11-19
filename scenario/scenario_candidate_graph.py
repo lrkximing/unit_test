@@ -184,6 +184,9 @@ def _fallthrough_edges_before_success(
     success_line: int,
 ) -> List[SourceFact]:
     edges: List[SourceFact] = []
+    success = next((fact for fact in facts if fact.function == target_function and fact.kind == "RETURN"
+                    and fact.start_line == success_line and fact.metadata.get("return_expression") == "0"), None)
+    guards = {fact.fact_id: fact for fact in facts if fact.kind == "GUARD"}
     for fact in sorted(_facts_by_kind(facts, "BRANCH_EDGE"), key=lambda item: item.start_line):
         if fact.function != target_function:
             continue
@@ -191,7 +194,11 @@ def _fallthrough_edges_before_success(
         if metadata.get("edge") != "fallthrough":
             continue
         first_return_line = int(metadata.get("first_return_line") or 0)
-        if first_return_line and first_return_line < success_line:
+        guard = guards.get(metadata.get("guard_fact_id"))
+        if (success is not None and guard is not None and guard.end_line < success_line
+                and guard.metadata.get("consequence_has_direct_return")
+                and guard.metadata.get("control_context") == success.metadata.get("control_context")
+                and first_return_line and first_return_line < success_line):
             edges.append(fact)
     return edges
 
@@ -260,10 +267,21 @@ def _return_targets_from_fact(
         if relation.startswith("call_result_influences_"):
             if target.kind == "RETURN" and target.function == target_function:
                 results.append(target)
+            elif (target.kind == "GUARD" and target.function == target_function
+                  and target.metadata.get("consequence_has_direct_return")):
+                for guard_edge in _relation_edges(target):
+                    returned = fact_by_id.get(str(guard_edge.get("target_fact_id", "")))
+                    if (guard_edge.get("relation") == "guard_first_return" and returned is not None
+                            and returned.function == target_function and returned.kind == "RETURN"
+                            and not returned.metadata.get("return_expression", "").strip()):
+                        results.append(returned)
             elif target.kind in {"CALL", "MEMBER_CALL", "RETURN"}:
                 results.extend(_return_targets_from_fact(target, fact_by_id, target_function, seen))
         elif relation in {"entered_from_internal_call", "reached_from_internal_call"}:
-            results.extend(_return_targets_from_fact(target, fact_by_id, target_function, seen))
+            # Reaching a helper operation is execution evidence, not proof that
+            # this operation's result is returned by the caller.
+            if fact.kind == "RETURN" and fact.metadata.get("return_expression", "").strip():
+                results.extend(_return_targets_from_fact(target, fact_by_id, target_function, seen))
 
     deduped: List[SourceFact] = []
     seen_returns: Set[str] = set()
@@ -486,7 +504,25 @@ def _candidate(
     dependent_boundaries: Optional[List[str]] = None,
 ) -> ScenarioCandidate:
     observations = observations or []
-    checks = scenario_checks or _checks_from_observations(candidate_id, observations, source_anchors)
+    checks = list(scenario_checks or [])
+    # Witness checks must not suppress the primary return/state observation.
+    for check in _checks_from_observations(candidate_id, observations, source_anchors):
+        if check.target == "return_value" and any(c.kind.startswith("Return") for c in checks):
+            continue
+        if check.kind == "ObservationRelation" and any(c.target == check.target for c in checks):
+            continue
+        if any(c.target == check.target and not c.kind.startswith("Boundary") for c in checks):
+            continue
+        if check.target == "return_value":
+            returns = [f for f in facts if f.fact_id in check.evidence_ids and f.kind == "RETURN"]
+            expressions = {f.metadata.get("return_expression", "").strip() for f in returns} - {""}
+            if len(expressions) == 1:
+                expression = next(iter(expressions))
+                check.kind = "ReturnEquals" if _is_grounded_exact_return_expression(expression) else "ReturnComputation"
+                check.expected_relation = (f"equals {expression}" if check.kind == "ReturnEquals" else
+                    f"derive the exact result of `{expression}` from the selected input, pre-state and controlled boundary effects; "
+                    "use original helper/macro definitions, not a second target call or a copy of the observed result")
+        checks.append(check)
     return ScenarioCandidate(
         candidate_id=candidate_id,
         target_function=target_function,
@@ -591,7 +627,7 @@ def _candidate_from_guard(
             if boundary.candidate_id in dependent_boundaries:
                 continue
             dependent_boundaries.append(boundary.candidate_id)
-            witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count == 1")
+            witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count >= 1")
             effect = _required_effect(
                 candidate_id,
                 boundary,
@@ -610,11 +646,14 @@ def _candidate_from_guard(
                     check_id=_stable_id("CHK", candidate_id, boundary.candidate_id, "boundary_called"),
                     kind="BoundaryCalled",
                     target=boundary.candidate_id,
-                    expected_relation="boundary call_count == 1",
+                    expected_relation="boundary call_count >= 1",
                     evidence_ids=list(boundary.fact_ids),
                 )
             )
-    later_boundary = _first_boundary_after(boundaries, guard.function, guard.start_line)
+    # Only calls after the selected return are excluded; calls inside the guard
+    # can be required to compute that return value.
+    later_boundary = (_first_boundary_after(boundaries, guard.function, return_fact.end_line)
+                      if return_fact is not None else None)
     if later_boundary is not None:
         witness = _boundary_witness(
             candidate_id,
@@ -678,21 +717,26 @@ def _candidate_from_boundary_result(
         return None
     related_returns = _boundary_return_targets(boundary, fact_by_id, target_function)
     return_fact = sorted(related_returns, key=lambda item: item.start_line)[0] if related_returns else None
-    if return_fact is None and boundary.result_assignee:
+    if return_fact is None and boundary.result_assignee and boundary.source_function == target_function:
         return_fact = _return_after(facts, boundary.source_function, boundary.source_line, boundary.result_assignee)
     if return_fact is None:
         return None
 
-    candidate_id = f"{target_function}:boundary_error:{_stable_id('A', boundary.candidate_id)}"
+    return_expression = (return_fact.metadata or {}).get("return_expression", "").strip()
+    returns_value = bool(return_expression)
+
+    candidate_id = f"{target_function}:boundary_result:{_stable_id('A', boundary.candidate_id)}"
     source_anchors = list(boundary.fact_ids) + [return_fact.fact_id]
-    witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count == 1")
+    # Source reachability does not establish multiplicity (loops/helpers may repeat).
+    witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count >= 1")
     flow_target = boundary.result_assignee or "the boundary return value"
     effect = _required_effect(
         candidate_id,
         boundary,
-        "negative_errno",
-        f"boundary {boundary.expression} produces a negative errno through {flow_target}",
-        f"target return equals the boundary-produced errno through {flow_target}",
+        "controlled_result",
+        f"boundary {boundary.expression} produces a source-consistent controlled result through {flow_target}",
+        (f"target return is derived from the boundary effect through {flow_target}" if returns_value else
+         "target early exit preserves or changes observable output/state according to the selected boundary effect"),
         source_anchors,
     )
     return _candidate(
@@ -705,7 +749,8 @@ def _candidate_from_boundary_result(
         trigger_conditions=[
             Condition(
                 condition_id=_stable_id("COND", candidate_id, "boundary_effect"),
-                expression=f"boundary {boundary.candidate_id} produces a negative errno",
+                expression=(f"choose a result of {boundary.candidate_id} consistent with its type and the local source guards; "
+                            "do not assume every boundary returns an errno"),
                 evidence_ids=boundary.fact_ids,
             )
         ],
@@ -715,8 +760,8 @@ def _candidate_from_boundary_result(
         observations=[
             Observation(
                 observation_id=_stable_id("OBS", candidate_id, "return"),
-                kind="return_value",
-                target="return_value",
+                kind="return_value" if returns_value else "early_exit",
+                target="return_value" if returns_value else "target_result_or_state",
                 evidence_ids=source_anchors,
             ),
             Observation(
@@ -729,16 +774,19 @@ def _candidate_from_boundary_result(
         scenario_checks=[
             ResultCheck(
                 check_id=_stable_id("CHK", candidate_id, "return"),
-                kind="ReturnEqualsBoundaryEffect",
-                target="return_value",
-                expected_relation=f"equals negative errno produced by {boundary.candidate_id}",
+                kind="ReturnComputation" if returns_value else "ObservableEffect",
+                target="return_value" if returns_value else "target_result_or_state",
+                expected_relation=(f"derive the exact target return of `{return_expression}` from the selected controlled result of {boundary.candidate_id}; "
+                                   "do not assume an internal helper return is the target return" if returns_value else
+                                   "assert the observable output/state or captured interaction after the target early exit; "
+                                   "the void target has no return value to assert"),
                 evidence_ids=source_anchors,
             ),
             ResultCheck(
                 check_id=_stable_id("CHK", candidate_id, "boundary_called"),
                 kind="BoundaryCalled",
                 target=boundary.candidate_id,
-                expected_relation="boundary call_count == 1",
+                expected_relation="boundary call_count >= 1",
                 evidence_ids=boundary.fact_ids,
             ),
         ],
@@ -775,7 +823,7 @@ def _candidates_from_boundary_outputs(
     for guard in sorted(guards, key=lambda item: item.start_line):
         return_expr = (guard.metadata or {}).get("first_return_expression")
         candidate_id = f"{target_function}:boundary_output:{_stable_id('A', boundary.candidate_id, guard.fact_id)}"
-        witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count == 1")
+        witness = _boundary_witness(candidate_id, boundary, "called", "boundary call_count >= 1")
         effect = _required_effect(
             candidate_id,
             boundary,
@@ -789,7 +837,7 @@ def _candidates_from_boundary_outputs(
                 check_id=_stable_id("CHK", candidate_id, "boundary_called"),
                 kind="BoundaryCalled",
                 target=boundary.candidate_id,
-                expected_relation="boundary call_count == 1",
+                expected_relation="boundary call_count >= 1",
                 evidence_ids=boundary.fact_ids,
             )
         ]
@@ -861,6 +909,17 @@ def _candidate_from_terminal_effects(
             for edge in _fallthrough_edges_before_success(facts, target_function, success_return.start_line)
         )
     source_anchors.extend(fact.fact_id for fact in field_writes)
+    enclosing_edges = []
+    for requirement in (success_return.metadata.get("control_context", []) if success_return else []):
+        if requirement.get("kind") != "if":
+            continue
+        guard = next((fact for fact in facts if fact.function == target_function and fact.kind == "GUARD"
+                      and fact.start_line == requirement["line"]), None)
+        if guard:
+            edge = _branch_edge_for_guard(facts, guard, "branch" if requirement["outcome"] else "fallthrough")
+            if edge:
+                enclosing_edges.append(edge)
+                source_anchors.append(edge.fact_id)
 
     checks: List[ResultCheck] = []
     observations: List[Observation] = []
@@ -882,23 +941,29 @@ def _candidate_from_terminal_effects(
                 evidence_ids=[success_return.fact_id],
             )
         )
+    writes_by_field = {}
     for fact in field_writes:
-        metadata = fact.metadata or {}
+        writes_by_field.setdefault((fact.metadata or {}).get("left", ""), []).append(fact)
+    for field_name, writes in writes_by_field.items():
+        # Alternative and overwritten assignments are evidence for ONE final-state
+        # observation, not a conjunction of postconditions for every lexical write.
+        evidence = [fact.fact_id for fact in writes]
         checks.append(
             ResultCheck(
-                check_id=_stable_id("CHK", candidate_id, fact.fact_id, "field"),
-                kind="FieldEquals",
-                target=metadata.get("left", ""),
-                expected_relation=f"equals {metadata.get('right', '')}",
-                evidence_ids=[fact.fact_id],
+                check_id=_stable_id("CHK", candidate_id, field_name, "post_state"),
+                kind="FieldObservation",
+                target=field_name,
+                expected_relation=("derive the final value from the selected input, pre-state and boundary effects; "
+                                   "respect guards, write order and operations; do not assert every lexical assignment simultaneously"),
+                evidence_ids=evidence,
             )
         )
         observations.append(
             Observation(
-                observation_id=_stable_id("OBS", candidate_id, fact.fact_id, "field"),
+                observation_id=_stable_id("OBS", candidate_id, field_name, "field"),
                 kind="driver_state",
-                target=metadata.get("left", ""),
-                evidence_ids=[fact.fact_id],
+                target=field_name,
+                evidence_ids=evidence,
             )
         )
 
@@ -910,6 +975,16 @@ def _candidate_from_terminal_effects(
         if not include and _runtime_dependency_boundary(boundary):
             include = bool(_boundary_return_targets(boundary, fact_by_id, target_function))
         if not include or boundary.candidate_id in seen_boundaries:
+            continue
+        # This terminal scenario does not prove that every lexical boundary is
+        # executed. Keep optional/helper dependencies in the source graph; only
+        # attach mandatory interaction witnesses for direct unconditional calls
+        # before this return. The LLM still sees the complete target/helper code.
+        call_facts = [fact_by_id[fid] for fid in boundary.fact_ids if fid in fact_by_id]
+        if not any(f.function == target_function and f.kind in {"CALL", "MEMBER_CALL"}
+                   and "control_context" in f.metadata and not f.metadata["control_context"]
+                   and (success_return is None or f.metadata.get("source_order", 0) < success_return.metadata.get("source_order", 0))
+                   for f in call_facts):
             continue
         seen_boundaries.add(boundary.candidate_id)
         active_boundaries.append(boundary)
@@ -951,6 +1026,7 @@ def _candidate_from_terminal_effects(
                 evidence_ids=source_anchors,
             )
         ]
+        + [_condition_for_branch_edge(candidate_id, edge) for edge in enclosing_edges]
         + (
             [
                 _condition_for_branch_edge(candidate_id, edge)
@@ -984,7 +1060,7 @@ def _candidate_from_unanchored_return(
     candidate_id = f"{target_function}:return:{_stable_id('A', return_fact.fact_id)}"
     dependent_boundaries = _boundaries_reaching_return(return_fact, boundaries, fact_by_id, target_function)
     witnesses = [
-        _boundary_witness(candidate_id, boundary, "called", "boundary call_count == 1")
+        _boundary_witness(candidate_id, boundary, "called", "boundary call_count >= 1")
         for boundary in dependent_boundaries
     ]
     constraints = [
@@ -1023,7 +1099,7 @@ def _candidate_from_unanchored_return(
                 check_id=_stable_id("CHK", candidate_id, boundary.candidate_id, "boundary_called"),
                 kind="BoundaryCalled",
                 target=boundary.candidate_id,
-                expected_relation="boundary call_count == 1",
+                expected_relation="boundary call_count >= 1",
                 evidence_ids=list(boundary.fact_ids),
             )
         )
@@ -1044,8 +1120,8 @@ def _candidate_from_unanchored_return(
         observations=[
             Observation(
                 observation_id=_stable_id("OBS", candidate_id, "return"),
-                kind="return_value",
-                target="return_value",
+                kind="return_value" if expression.strip() else "early_exit",
+                target="return_value" if expression.strip() else "target_result_or_state",
                 evidence_ids=[return_fact.fact_id],
             )
         ],
@@ -1222,7 +1298,8 @@ def _candidate_fingerprint(candidate: ScenarioCandidate) -> Tuple:
         sorted(
             (
                 constraint.boundary_id,
-                tuple(effect.relation for effect in constraint.required_effects),
+                tuple((effect.description, effect.relation) for effect in constraint.required_effects),
+                tuple((p.description, tuple(p.object_path)) for p in constraint.preconditions),
             )
             for constraint in candidate.hardware_environment_constraints
         )
@@ -1251,6 +1328,66 @@ def _dedupe_candidates(candidates: Sequence[ScenarioCandidate]) -> List[Scenario
         seen_fingerprints.add(fingerprint)
         unique.append(candidate)
     return unique
+
+
+def _boundary_argument_candidates(target_function, wrapper, facts, boundaries):
+    """An executed boundary has an argument contract even if its return is tested."""
+    by_id = _fact_map(facts)
+    candidates = []
+    for boundary in boundaries:
+        if not _runtime_dependency_boundary(boundary) or boundary.source_function != target_function:
+            continue
+        call = _boundary_source_fact(boundary, by_id)
+        if call is None or call.kind not in {"CALL", "MEMBER_CALL"}:
+            continue
+        candidate_id = f"{target_function}:interaction:{_stable_id('A', boundary.candidate_id)}"
+        checks = [ResultCheck(
+            check_id=_stable_id("CHK", candidate_id, index), kind="BoundaryArgument",
+            target="captured_boundary_arguments", boundary_id=boundary.candidate_id, argument_index=index,
+            expected_relation=(f"capture actual argument {index} (`{argument}`) of `{boundary.expression}` in the connected mock; "
+                               "check its exact value or relevant pointed-to contents from the chosen inputs and original code; "
+                               "copy transient buffer contents during the call, before their lifetime ends"),
+            evidence_ids=list(boundary.fact_ids))
+            for index, argument in enumerate(boundary.arguments)]
+        if not checks:
+            continue
+        candidates.append(_candidate(
+            candidate_id, target_function, wrapper, list(boundary.fact_ids), facts,
+            "source_fact_graph:boundary_arguments",
+            trigger_conditions=[Condition(_stable_id("COND", candidate_id),
+                f"choose inputs and environment satisfying the source guards so that `{boundary.expression}` at line {boundary.source_line} executes",
+                list(boundary.fact_ids))],
+            scenario_checks=checks,
+            hardware_environment_constraints=[_constraint_for_boundary(candidate_id, boundary, facts, [], [])],
+            dependent_boundaries=[boundary.candidate_id]))
+    return candidates
+
+
+def _candidate_from_boundary_interactions(target_function, wrapper, facts, boundaries):
+    """Cover effect-only functions without inventing a return/post-state value."""
+    interactions = [boundary for boundary in boundaries if _runtime_dependency_boundary(boundary)]
+    if not interactions:
+        return None
+    anchors = list(dict.fromkeys([fact.fact_id for fact in facts
+                                 if fact.function == target_function and fact.kind in {"CALL", "MEMBER_CALL"}] +
+                                [fid for boundary in interactions for fid in boundary.fact_ids]))
+    candidate_id = f"{target_function}:interaction:{_stable_id('A', target_function, 'interaction')}"
+    return _candidate(
+        candidate_id=candidate_id, target_function=target_function, wrapper=wrapper,
+        source_anchors=anchors, facts=facts, derivation="source_fact_graph:boundary_interaction",
+        trigger_conditions=[Condition(condition_id=_stable_id("COND", candidate_id, "inputs"),
+            expression="initialize the concrete inputs and object paths needed to execute the target's boundary interactions",
+            evidence_ids=anchors)],
+        hardware_environment_constraints=[_constraint_for_boundary(candidate_id, boundary, facts, [], [])
+                                          for boundary in interactions],
+        observations=[Observation(observation_id=_stable_id("OBS", candidate_id, "arguments"),
+            kind="boundary_interaction", target="captured_boundary_arguments", evidence_ids=anchors)],
+        scenario_checks=[ResultCheck(check_id=_stable_id("CHK", candidate_id, "arguments"),
+            kind="ObservableEffect", target="captured_boundary_arguments",
+            expected_relation="derive exact boundary argument values, order and invocation counts from the chosen inputs and original target/helper code; capture actual arguments in the connected mocks, not only a call counter",
+            evidence_ids=anchors)],
+        runtime_witnesses=[], dependent_boundaries=[boundary.candidate_id for boundary in interactions],
+    )
 
 
 def build_scenario_candidates(
@@ -1329,6 +1466,11 @@ def build_scenario_candidates(
             candidates.append(candidate)
             anchored_fact_ids.update(candidate.source_anchors)
 
+    if not candidates:
+        interaction = _candidate_from_boundary_interactions(target_function, wrapper, facts, boundaries)
+        if interaction is not None:
+            candidates.append(interaction)
+    candidates.extend(_boundary_argument_candidates(target_function, wrapper, facts, boundaries))
     return _dedupe_candidates(candidates)
 
 

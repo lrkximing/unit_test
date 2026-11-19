@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 try:
     from tree_sitter_languages import get_parser
@@ -24,6 +24,15 @@ class KunitBinding:
     check_ids: List[str] = field(default_factory=list)
     witness_ids: List[str] = field(default_factory=list)
     effect_ids: List[str] = field(default_factory=list)
+    source_text: str = ""
+    start_byte: int = 0
+    support_source: str = ""
+    mock_names: List[str] = field(default_factory=list)
+    field_projections: Dict = field(default_factory=dict)
+    boundary_mocks: Dict = field(default_factory=dict)
+    observation_context: Dict = field(default_factory=dict)
+    source_facts: List = field(default_factory=list)
+    boundary_candidates: List = field(default_factory=list)
 
 
 def _node_text(code: bytes, node) -> str:
@@ -72,6 +81,8 @@ def _comment_markers(code_text: str):
         comments.append(
             {
                 "line": node.end_point[0] + 1,
+                "end_byte": node.end_byte,
+                "start_byte": node.start_byte,
                 "checks": CHECK_MARKER_PATTERN.findall(text),
                 "witnesses": WITNESS_MARKER_PATTERN.findall(text),
                 "effects": EFFECT_MARKER_PATTERN.findall(text),
@@ -133,7 +144,18 @@ def collect_kunit_bindings(code_text: str) -> List[KunitBinding]:
             continue
         start_line = node.start_point[0] + 1
         min_line = _enclosing_function_start_line(node)
-        check_ids, witness_ids, effect_ids = _nearby_markers(comments, start_line, min_line=min_line)
+        # Only adjacent annotations belong to this assertion, not all markers
+        # within an arbitrary line-distance window.
+        adjacent = []
+        cursor = node.start_byte
+        for comment in reversed(comments):
+            if comment["end_byte"] > cursor:
+                continue
+            if code[comment["end_byte"]:cursor].strip():
+                break
+            adjacent.append(comment)
+            cursor = comment["start_byte"]
+        check_ids, witness_ids, effect_ids = _nearby_markers(adjacent, start_line, min_line=min_line, max_distance=float("inf"))
         statement_text = _node_text(code, node)
         check_ids = _merge_marker_ids(check_ids, statement_text, CHECK_MARKER_PATTERN)
         witness_ids = _merge_marker_ids(witness_ids, statement_text, WITNESS_MARKER_PATTERN)
@@ -147,6 +169,8 @@ def collect_kunit_bindings(code_text: str) -> List[KunitBinding]:
                 check_ids=check_ids,
                 witness_ids=witness_ids,
                 effect_ids=effect_ids,
+                source_text=code_text,
+                start_byte=node.start_byte,
             )
         )
     return bindings
@@ -155,61 +179,26 @@ def collect_kunit_bindings(code_text: str) -> List[KunitBinding]:
 def _collect_kunit_bindings_fallback(code_text: str) -> List[KunitBinding]:
     comments = _comment_markers(code_text)
     bindings: List[KunitBinding] = []
-    # Preserve offsets while masking comments, so a marker or sample macro
-    # inside a comment cannot be mistaken for an executable assertion.
-    masked = re.sub(
-        r"/\*[\s\S]*?\*/|//[^\n]*",
-        lambda match: "".join("\n" if char == "\n" else " " for char in match.group(0)),
-        code_text,
-    )
-    for match in KUNIT_STATEMENT_PATTERN.finditer(masked):
-        start = match.start()
-        open_paren = masked.find("(", start, match.end())
-        if open_paren < 0:
+    for idx, line in enumerate(code_text.splitlines(), start=1):
+        match = KUNIT_STATEMENT_PATTERN.search(line)
+        if not match:
             continue
-        depth = 0
-        quote = ""
-        escaped = False
-        end = None
-        for pos in range(open_paren, len(masked)):
-            char = masked[pos]
-            if escaped:
-                escaped = False
-                continue
-            if char == "\\" and quote:
-                escaped = True
-                continue
-            if quote:
-                if char == quote:
-                    quote = ""
-                continue
-            if char in {'"', "'"}:
-                quote = char
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    end = pos + 1
-                    break
-        if end is None:
-            continue
-        idx = masked.count("\n", 0, start) + 1
-        macro = masked[start:open_paren].strip()
-        statement = code_text[start:end]
+        macro = line[match.start() :].split("(", 1)[0].strip()
         check_ids, witness_ids, effect_ids = _nearby_markers(comments, idx)
-        check_ids = _merge_marker_ids(check_ids, statement, CHECK_MARKER_PATTERN)
-        witness_ids = _merge_marker_ids(witness_ids, statement, WITNESS_MARKER_PATTERN)
-        effect_ids = _merge_marker_ids(effect_ids, statement, EFFECT_MARKER_PATTERN)
+        check_ids = _merge_marker_ids(check_ids, line, CHECK_MARKER_PATTERN)
+        witness_ids = _merge_marker_ids(witness_ids, line, WITNESS_MARKER_PATTERN)
+        effect_ids = _merge_marker_ids(effect_ids, line, EFFECT_MARKER_PATTERN)
         bindings.append(
             KunitBinding(
                 macro=macro,
                 start_line=idx,
-                end_line=masked.count("\n", 0, end) + 1,
-                statement_text=statement,
+                end_line=idx,
+                statement_text=line.strip(),
                 check_ids=check_ids,
                 witness_ids=witness_ids,
                 effect_ids=effect_ids,
+                source_text=code_text,
+                start_byte=sum(len(line.encode()) + 1 for line in code_text.splitlines()[:idx - 1]),
             )
         )
     return bindings

@@ -2,6 +2,33 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from validation.region_check import extract_test_names
+from validation.test_inspector import C_PARSER
+
+
+def source_tokens(code):
+    if C_PARSER is None:
+        raise RuntimeError("Tree-sitter is required to validate automatic source repairs")
+    raw = (code or "").encode()
+    tokens, pending = [], [C_PARSER.parse(raw).root_node]
+    while pending:
+        node = pending.pop()
+        if node.type == "comment":
+            continue
+        if node.children:
+            pending.extend(reversed(node.children))
+        else:
+            tokens.append((node.type, raw[node.start_byte:node.end_byte]))
+    return tuple(tokens)
+
+
+def test_set_errors(audit, stage, removable_tests=()):
+    """Repair may fill missing scenarios, but must not discard existing tests."""
+    removed = set(audit.get("removed_tests", []))
+    if stage.startswith("scenario"):
+        removed -= set(removable_tests)
+    if removed:
+        return [f"Repair removed existing test functions: {sorted(removed)}. Keep existing tests and supplement missing scenarios."]
+    return []
 
 
 @dataclass

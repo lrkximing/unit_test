@@ -383,7 +383,7 @@ def assess_oracle_binding(
     return OracleAssessment("proven" if actual == _TARGET_RETURN else "unresolved")
 
 
-def oracle_repair_errors(before_code: str, after_code: str, registry: Dict) -> List[str]:
+def oracle_repair_errors(before_code: str, after_code: str, registry: Dict, *, context: Optional[Dict] = None) -> List[str]:
     """Reject removal or broadening of a previously substantive scenario check.
 
     An incorrect assertion may be corrected: exact expected values may change
@@ -414,6 +414,9 @@ def oracle_repair_errors(before_code: str, after_code: str, registry: Dict) -> L
         new_bindings = collect_kunit_bindings(revised.full_text)
         for scenario_id in original.scenario_ids:
             contract = contracts.get(scenario_id, {})
+            if context and "scenario_variants" in context:
+                from scenario.condition_variants import contract_for_variant
+                contract = contract_for_variant(context, scenario_id, original.variant_id) or {}
             wrapper = str(contract.get("export_function", "") or "")
             for check in contract.get("scenario_checks", []) or []:
                 check_id = check.get("check_id")

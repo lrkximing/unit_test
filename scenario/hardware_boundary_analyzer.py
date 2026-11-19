@@ -1,5 +1,6 @@
 import hashlib
 import re
+from pathlib import Path
 from typing import Dict, Iterable, List, Set
 
 from scenario.fact_model import BoundaryCandidate, SourceFact
@@ -71,7 +72,10 @@ def _call_looks_like_pure_software_helper(fact: SourceFact) -> bool:
     if _call_result_is_pointer_setup(fact):
         return True
     if not _call_has_controllable_effect(fact):
-        return True
+        # Discarding a return value does not prove purity: an object-backed
+        # call may write hardware or state. Leave it unresolved unless its
+        # boundary role is established; do not mock all pointer-taking helpers.
+        return not _has_object_like_argument(metadata)
     relations = {
         str(edge.get("relation", ""))
         for edge in metadata.get("relation_edges", []) or []
@@ -100,7 +104,7 @@ def _boundary_from_call(fact: SourceFact, internal_functions: Set[str]) -> Bound
     if is_direct_external:
         notes = [
             "This is a direct external call from driver code. A same-name fake function or macro in the test file will not intercept it.",
-            "The test must configure a real object/hook/wrapper/instrumentation path that affects this production call; if repeated repair attempts cannot do so, the scenario is marked unrealizable by the iteration loop.",
+            "The test must configure an actual object/hook path affecting this production call. Missing control or exhausted attempts remain unresolved, not proof that the scenario is unrealizable.",
         ]
     elif fact.kind == "MEMBER_CALL":
         notes = [
@@ -177,6 +181,9 @@ def analyze_boundary_candidates(parse_result, facts: Iterable[SourceFact]) -> Li
     """
     internal_functions = _internal_function_names(parse_result)
     file_local_macros = _file_local_macro_names(parse_result)
+    from analysis.header_context import included_function_macros
+    source_path = Path(getattr(parse_result, "path", ""))
+    header_macros = included_function_macros(source_path) if source_path.is_file() else set()
     candidates: Dict[str, BoundaryCandidate] = {}
 
     for fact in facts:
@@ -189,6 +196,15 @@ def analyze_boundary_candidates(parse_result, facts: Iterable[SourceFact]) -> Li
             if callee in file_local_macros:
                 continue
             candidate = _boundary_from_call(fact, internal_functions)
+            if callee in header_macros:
+                # Hook generation already excludes these symbols: a macro expands
+                # inside production code and is not an independently callable API.
+                candidate.semantic_role = "environment_prerequisite"
+                candidate.classification_reason = "literal-header function macro; preserve source semantics, not an independently interceptable call"
+                candidate.environment_notes = [
+                    "Evaluate this macro through the original target and source-defined inputs. Its expansion may have effects; this classification does not establish purity.",
+                    "Do not invent a macro return hook, injected errno or call counter. Preserve source guard, return and state checks, and realize underlying interfaces through their actual controls.",
+                ]
         elif fact.kind == "MEMBER_CALL":
             candidate = _boundary_from_call(fact, internal_functions)
         elif fact.kind in {"FIELD_ACCESS", "FIELD_WRITE"}:

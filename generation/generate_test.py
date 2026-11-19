@@ -15,6 +15,8 @@ import re
 from typing import Dict, Iterable, List, Tuple, Optional
 from generation.scenario_context import format_scenario_context_for_prompt
 from validation.test_inspector import inspect_test_source
+from analysis.local_dependencies import collect_local_definitions, identifiers, walk
+from tree_sitter_languages import get_parser
 from scenario.harness_feasibility import (
     allowed_generated_scenario_ids,
     registry_from_context,
@@ -35,9 +37,11 @@ def strip_markdown_code_fence(text: str) -> str:
         return "\n"
     stripped = text.strip()
     pattern = re.compile(r"```(?:[^\n`]*)?\n([\s\S]*?)```", re.IGNORECASE)
-    match = pattern.search(stripped)
-    if match:
-        code = match.group(1).strip("\n")
+    matches = list(pattern.finditer(stripped))
+    if matches:
+        # Keep every supplied code block in response order, not just the first
+        # illustrative fragment. Existing source/patch validation still applies.
+        code = "\n\n".join(match.group(1).strip("\n") for match in matches)
         return (code + "\n") if code else "\n"
     lines = stripped.splitlines()
     if lines and lines[0].strip().startswith("```"):
@@ -90,49 +94,7 @@ def _format_external_symbols(function) -> str:
 
 
 def _collect_driver_local_definitions(parse_result, function) -> Tuple[List[str], List[str]]:
-    if not parse_result or not function:
-        return [], []
-
-    macros: List[str] = []
-    structs: List[str] = []
-
-    macro_names = set(getattr(function, "macro_refs", []) or [])
-    internal_macros = function.file_internal_symbols.get("macros", []) if getattr(function, "file_internal_symbols", None) else []
-    macro_names.update(internal_macros or [])
-    macro_infos = []
-    for name in macro_names:
-        info = parse_result.macros.get(name) if getattr(parse_result, "macros", None) else None
-        if info:
-            macro_infos.append(info)
-
-    struct_names = set(getattr(function, "type_refs", []) or [])
-    internal_types = function.file_internal_symbols.get("types", []) if getattr(function, "file_internal_symbols", None) else []
-    struct_names.update(internal_types or [])
-    struct_infos = []
-    structs_map = getattr(parse_result, "structs", {}) or {}
-    for name in struct_names:
-        info = structs_map.get(name)
-        if info:
-            struct_infos.append(info)
-            for identifier in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", info.code or ""):
-                macro_info = parse_result.macros.get(identifier) if getattr(parse_result, "macros", None) else None
-                if macro_info:
-                    macro_infos.append(macro_info)
-    seen_macro_names = set()
-    unique_macro_infos = []
-    for info in sorted(macro_infos, key=lambda m: getattr(m, "line", 0)):
-        if info.name in seen_macro_names:
-            continue
-        seen_macro_names.add(info.name)
-        unique_macro_infos.append(info)
-    for info in unique_macro_infos:
-        macros.append(info.code.strip())
-
-    struct_infos.sort(key=lambda s: getattr(s, "start_line", 0))
-    for info in struct_infos:
-        structs.append(info.code.strip("\n"))
-
-    return macros, structs
+    return collect_local_definitions(parse_result, function)
 
 
 def _format_driver_local_definitions_for_prompt(macros: List[str], structs: List[str]) -> str:
@@ -145,7 +107,7 @@ def _format_driver_local_definitions_for_prompt(macros: List[str], structs: List
     if structs:
         if lines:
             lines.append("")
-        lines.append("Driver Structs:")
+        lines.append("Driver Types (including transitive enum/typedef/field dependencies):")
         lines.extend(structs)
     return "\n".join(lines)
 
@@ -228,7 +190,7 @@ def _invoke_generation_model(prompt: str, local_or_api: str, model, tokenizer) -
             )
         generated_ids = test_case_outputs[0][test_case_inputs["input_ids"].shape[1]:]
         return tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return strip_markdown_code_fence(gpt_api(prompt))
+    return gpt_api(prompt)
 
 
 def _compute_required_headers(export_interfaces, driver_includes: Iterable[str]) -> List[str]:
@@ -462,37 +424,67 @@ def _ensure_scenario_marker_in_block(block: str, scenario_ids: Iterable[str]) ->
 
 
 def _function_references(name: str, text: str) -> bool:
-    return bool(re.search(r"\b" + re.escape(name) + r"\s*\(", text or ""))
+    return name in identifiers(text or "")
 
 
-def _select_referenced_helpers(helper_blocks: List[Tuple[str, str]], test_blocks: List[str]) -> List[str]:
-    kept: List[Tuple[str, str]] = []
-    selected_names = set()
-    search_text = "\n\n".join(test_blocks)
+def _select_support_declarations(raw, helper_blocks, test_blocks):
+    """Keep reachable state and callback tables as well as function bodies."""
+    source = raw.encode()
+    tree = get_parser("c").parse(source)
+    candidates = []
+    def collect(node):
+        if node.type in {"declaration", "type_definition", "preproc_def", "preproc_function_def"}:
+            text = source[node.start_byte:node.end_byte].decode()
+            if not re.match(r"\s*extern\b", text):
+                candidates.append(text)
+        elif node.type in {"struct_specifier", "union_specifier", "enum_specifier"}:
+            if node.child_by_field_name("body"):
+                candidates.append(source[node.start_byte:node.end_byte].decode().rstrip(";") + ";")
+        elif node.type != "function_definition":
+            for child in node.named_children:
+                collect(child)
+    collect(tree.root_node)
+    roots = "\n".join(test_blocks)
+    selected, helper_names = [], set()
     changed = True
     while changed:
         changed = False
         for name, block in helper_blocks:
-            if name in selected_names:
-                continue
-            if _function_references(name, search_text):
-                selected_names.add(name)
-                kept.append((name, block))
-                search_text += "\n" + block
+            if name not in helper_names and _function_references(name, roots):
+                helper_names.add(name)
+                roots += "\n" + block
                 changed = True
-    return [_ensure_static_function_block(block) for _, block in kept]
+        refs = identifiers(roots)
+        for declaration in candidates:
+            if declaration in selected:
+                continue
+            parsed = get_parser("c").parse(declaration.encode()).root_node
+            definitions = set()
+            for node in walk(parsed):
+                if node.type in {"declaration", "type_definition", "init_declarator", "preproc_def", "preproc_function_def"}:
+                    for field in ("declarator", "name"):
+                        for child in node.children_by_field_name(field):
+                            while child.child_by_field_name("declarator"):
+                                child = child.child_by_field_name("declarator")
+                            if child.type in {"identifier", "type_identifier"}:
+                                definitions.add(declaration.encode()[child.start_byte:child.end_byte].decode())
+                if node.type in {"struct_specifier", "union_specifier", "enum_specifier", "enumerator"}:
+                    child = node.child_by_field_name("name")
+                    if child and (node.type == "enumerator" or node.child_by_field_name("body")):
+                        definitions.add(declaration.encode()[child.start_byte:child.end_byte].decode())
+            if definitions & refs:
+                selected.append(declaration)
+                roots += "\n" + declaration
+                changed = True
+    declarations = [item for item in candidates if item in selected]
+    helpers = [_ensure_static_function_block(block) for name, block in helper_blocks if name in helper_names]
+    return declarations, helpers
 
 
 def _looks_like_generated_test_block(name: str, block: str) -> bool:
     if "RACA_SCENARIO:" in (block or ""):
         return True
     return bool(name.startswith("test_") and re.search(r"\bstruct\s+kunit\s*\*\s*test\b", block or ""))
-
-
-def _looks_like_llm_fake_helper(name: str, block: str) -> bool:
-    if "RACA_MOCK:" in (block or ""):
-        return True
-    return bool(re.search(r"(?:^|_)(?:fake|fakes|mock|mocks|local_fake)(?:_|$)|\braca_fake_", name or ""))
 
 
 def _function_prototype_from_block(block: str) -> str:
@@ -544,10 +536,7 @@ def _rebuild_initial_test_file(
     kept_tests = []
     for test in info.test_functions:
         scenario_ids = set(test.scenario_ids or [])
-        if len(scenario_ids) != 1:
-            continue
-        if allowed_scenarios is not None and not scenario_ids <= allowed_scenarios:
-            continue
+        # Retain invalid bindings for diagnostics/repair; never silently drop tests.
         kept_tests.append(test)
     kept_test_name_set = {test.name for test in kept_tests}
     blocks = _extract_function_blocks(raw)
@@ -570,10 +559,14 @@ def _rebuild_initial_test_file(
         if name not in test_name_set
         and not name.startswith("KUNIT_CASE")
         and not _looks_like_generated_test_block(name, block)
-        and not _looks_like_llm_fake_helper(name, block)
     ]
-    selected_helpers = _select_referenced_helpers(helper_blocks, test_blocks)
+    support_declarations, selected_helpers = _select_support_declarations(raw, helper_blocks, test_blocks)
+    fixed_definitions = {text.strip() for text in macros + structs}
+    support_declarations = [text for text in support_declarations if text.strip() not in fixed_definitions]
     helper_prototypes = _function_prototypes_from_blocks(selected_helpers)
+    framework_mock_names = {s["name"] for s in (scenario_context or {}).get("mock_interfaces", [])}
+    helper_prototypes = [p for p in helper_prototypes
+                         if not any(re.search(r"\b" + re.escape(name) + r"\s*\(", p) for name in framework_mock_names)]
 
     suite_id = _sanitize_c_identifier(function_name.lower(), "_raca")
     suite_name = _sanitize_c_identifier(function_name)
@@ -610,11 +603,16 @@ def _rebuild_initial_test_file(
                 "/* ===== Driver Local Definitions END ===== */",
             ]
         )
-    if selected_helpers:
-        helper_parts = []
+    if selected_helpers or support_declarations:
+        def type_or_macro(text):
+            children = get_parser("c").parse(text.encode()).root_node.named_children
+            return bool(children and (children[0].type in {"type_definition", "struct_specifier", "union_specifier", "enum_specifier", "preproc_def", "preproc_function_def"}
+                                      or (children[0].type == "declaration" and not children[0].child_by_field_name("declarator"))))
+        helper_parts = [text for text in support_declarations if type_or_macro(text)]
         if helper_prototypes:
             helper_parts.extend(helper_prototypes)
             helper_parts.append("")
+        helper_parts.extend(text for text in support_declarations if not type_or_macro(text))
         helper_parts.extend(selected_helpers)
         sections.extend(["", "/* ===== Flexible Helpers BEGIN ===== */", "\n\n".join(helper_parts), "/* ===== Flexible Helpers END ===== */"])
     if test_blocks:
@@ -627,6 +625,19 @@ def _rebuild_initial_test_file(
         f"\t.name = \"{suite_name}\",",
         f"\t.test_cases = {suite_id}_cases,",
     ]
+    clearers = []
+    for interface in (scenario_context or {}).get("target", {}).get("export_interface_details", []):
+        if interface.get("source_kind") == "boundary_hook" and interface.get("boundary_control_role") == "clear_hook":
+            match = re.search(r"\b([A-Za-z_]\w*)\s*\(", interface.get("prototype", ""))
+            if match and match.group(1) not in clearers:
+                clearers.append(match.group(1))
+    if clearers:
+        cleanup = "\n".join(f"\t{name}();" for name in clearers)
+        sections.extend(["", "/* ===== Framework Hook Lifecycle BEGIN ===== */",
+            f"static int {suite_id}_hook_init(struct kunit *case_context)\n{{\n{cleanup}\n\treturn 0;\n}}",
+            f"static void {suite_id}_hook_exit(struct kunit *case_context)\n{{\n{cleanup}\n}}",
+            "/* ===== Framework Hook Lifecycle END ===== */"])
+        suite_lines.extend([f"\t.init = {suite_id}_hook_init,", f"\t.exit = {suite_id}_hook_exit,"])
     suite_lines.append("};")
     sections.extend(
         [
@@ -644,7 +655,8 @@ def _rebuild_initial_test_file(
             "",
         ]
     )
-    return "\n".join(part for part in sections if part is not None).rstrip() + "\n"
+    from generation.mock_interfaces import install_mock_declarations
+    return install_mock_declarations("\n".join(part for part in sections if part is not None).rstrip() + "\n", scenario_context or {})
 
 
 def generate_test_case(
@@ -656,6 +668,7 @@ def generate_test_case(
     tokenizer,
     export_interfaces,
     scenario_context=None,
+    trace_path=None,
 ) -> str:
     function_code = function.code
     export_interface_block = _format_export_interfaces(export_interfaces)
@@ -679,8 +692,12 @@ def generate_test_case(
         scenario_context=format_scenario_context_for_prompt(scenario_context),
     )
     model_output = _invoke_generation_model(test_case_prompt, local_or_api, model, tokenizer).strip()
+    _write_generation_trace(trace_path, model_output)
+    generated_source = strip_markdown_code_fence(model_output)
+    if not inspect_test_source(generated_source).test_functions:
+        raise ValueError("Generation returned no KUnit test functions; original model response retained in generation trace")
     return _rebuild_initial_test_file(
-        model_output,
+        generated_source,
         function_name=function.name,
         required_headers=required_headers,
         export_interface_block=export_interface_block,
@@ -762,7 +779,8 @@ def extend_coverage_tests(function,
                           tokenizer,
                           scenario_context=None,
                           test_file_name: str = "test_case.c",
-                          trace_path: Optional[str] = None) -> str:
+                          trace_path: Optional[str] = None,
+                          repair_feedback: str = '') -> str:
     
     prompt = PromptTemplate.from_template(
         load_prompt_from_yaml(prompt_path, "test_case_extend_coverage_prompt")
@@ -777,6 +795,8 @@ def extend_coverage_tests(function,
         scenario_context=format_scenario_context_for_prompt(scenario_context),
         test_file_name=test_file_name,
     )
+    if repair_feedback:
+        test_case_prompt += '\n\n' + repair_feedback
     rewritten = _invoke_generation_model(test_case_prompt, local_or_api, model, tokenizer).strip()
     _write_generation_trace(trace_path, rewritten)
     return rewritten
